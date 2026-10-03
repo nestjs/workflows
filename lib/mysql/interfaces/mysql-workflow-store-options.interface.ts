@@ -3,10 +3,13 @@ import type { SqlExecutor } from '@nestjs/store-kit/mysql';
 /** What `new MySqlWorkflowStore(options, storage)` takes. */
 export interface MySqlWorkflowStoreOptions {
   /**
-   * How the store reaches the database: `fromMysql2(pool)`, `fromDrizzle(db)`, `fromTypeOrm(dataSource)`,
-   * `fromPrisma(prisma)` or `fromKysely(db)` from `@nestjs/workflows/mysql`. The store keeps its tables in the database
-   * the pool or ORM connects to; its own transactions run on it, and `start()` and `signal()` with `{ transaction }`
-   * take that client's transaction object.
+   * How the store reaches the database: `fromMysql2(pool)`, `fromSequelize(sequelize)`, `fromDrizzle(db)`,
+   * `fromTypeOrm(dataSource)`, `fromPrisma(prisma)` or `fromKysely(db)` from `@nestjs/workflows/mysql`. The store keeps
+   * its tables in the database the pool or ORM connects to; its own transactions run on it, and `start()` and
+   * `signal()` with `{ transaction }` take that client's transaction object: Drizzle's `tx`, a TypeORM
+   * `EntityManager`, a Prisma transaction client, a Kysely `Transaction`, a Sequelize `transaction`, a mysql2
+   * connection after `beginTransaction()`. `fromSequelize()` needs mysql2's `FOUND_ROWS` client flag: Sequelize's
+   * MySQL connection manager sets `flags: "-FOUND_ROWS"` unless the instance passes `dialectOptions: { flags: '' }`.
    */
   executor: SqlExecutor<'mysql'>;
   /**

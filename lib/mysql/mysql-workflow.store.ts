@@ -72,9 +72,10 @@ const ROWS_PER_INSERT = 1_000;
 
 /**
  * The first-party `WorkflowStore` on MySQL (8.4 LTS and 9.x), through the client the application already has
- * (`fromMysql2()`, `fromDrizzle()`, `fromTypeOrm()`, `fromPrisma()`, `fromKysely()`). It keeps its tables in the
- * connection's database, named `<schema>_<table>` (`nest_workflows_instances`...), which its migrations create and
- * bring up to date, and it joins the application's transactions for `start()` and `signal()` with `{ transaction }`.
+ * (`fromMysql2()`, `fromSequelize()`, `fromDrizzle()`, `fromTypeOrm()`, `fromPrisma()`,
+ * `fromKysely()`). It keeps its tables in the connection's database, named `<schema>_<table>`
+ * (`nest_workflows_instances`...), which its migrations create and bring up to date, and it joins the application's
+ * transactions for `start()` and `signal()` with `{ transaction }`.
  *
  * ```ts
  * @Module({

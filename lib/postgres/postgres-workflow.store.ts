@@ -52,9 +52,9 @@ const CANCELLABLE = `(${CANCELLABLE_STATUSES.map((status) => `'${status}'`).join
 
 /**
  * The first-party `WorkflowStore` on PostgreSQL, through the client the application already has (`fromPg()`,
- * `fromDrizzle()`, `fromTypeOrm()`, `fromPrisma()`, `fromKysely()`). It keeps its tables in a schema of its own
- * (`nest_workflows` by default), which its migrations create and bring up to date, and it joins the application's
- * transactions for `start()` and `signal()` with `{ transaction }`.
+ * `fromSequelize()`, `fromDrizzle()`, `fromTypeOrm()`, `fromPrisma()`, `fromKysely()`). It keeps its tables in a
+ * schema of its own (`nest_workflows` by default), which its migrations create and bring up to date, and it joins
+ * the application's transactions for `start()` and `signal()` with `{ transaction }`.
  *
  * ```ts
  * @Module({

@@ -38,10 +38,11 @@ export interface WorkflowStore {
   /**
    * Optional: `create()` through the application's transaction, for
    * `start(workflow, input, { transaction })`. `transaction` is what the application's ORM
-   * hands its transaction callback (a Drizzle `tx`, a TypeORM `EntityManager`...). Write only
-   * through it, so the instance commits or rolls back with the application's rows, and never
-   * catch a database error inside it (on PostgreSQL that aborts the transaction: use
-   * insert-or-ignore). Without this method, `start()` with a transaction throws.
+   * hands its transaction callback (a Drizzle `tx`, a TypeORM `EntityManager`, a Sequelize
+   * `transaction`...). Write only through it, so the instance commits or rolls back with the
+   * application's rows, and never catch a database error inside it (on PostgreSQL that aborts
+   * the transaction: use insert-or-ignore). Without this method, `start()` with a transaction
+   * throws.
    */
   createInTransaction?(transaction: unknown, instance: NewWorkflowInstance): Promise<{ instance: WorkflowInstance; created: boolean }>;
   /**

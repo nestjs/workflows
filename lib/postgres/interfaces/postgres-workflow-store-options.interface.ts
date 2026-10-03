@@ -3,9 +3,11 @@ import type { SqlExecutor } from '@nestjs/store-kit/postgres';
 /** What `new PostgresWorkflowStore(options, storage)` takes. */
 export interface PostgresWorkflowStoreOptions {
   /**
-   * How the store reaches the database: `fromPg(pool)`, `fromDrizzle(db)`, `fromTypeOrm(dataSource)`,
-   * `fromPrisma(prisma)` or `fromKysely(db)`. The store's own transactions run on it, and `start()` and `signal()`
-   * with `{ transaction }` take that client's transaction object.
+   * How the store reaches the database: `fromPg(pool)`, `fromSequelize(sequelize)`, `fromDrizzle(db)`,
+   * `fromTypeOrm(dataSource)`, `fromPrisma(prisma)` or `fromKysely(db)`. The store's own transactions run on it, and
+   * `start()` and `signal()` with `{ transaction }` take that client's transaction object: Drizzle's `tx`, a TypeORM
+   * `EntityManager`, a Prisma transaction client, a Kysely `Transaction`, a Sequelize `transaction`, a node-postgres
+   * client after `BEGIN`.
    */
   executor: SqlExecutor<'postgres'>;
   /**
