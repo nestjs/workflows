@@ -5,6 +5,7 @@
  * `WorkflowClient.result()`.
  */
 import { ResultWaiter, type ResultOutcome } from '../../lib/core/index.js';
+import { heapUsed } from '../support/heap.js';
 
 class Timeout extends Error {
   constructor(
@@ -123,4 +124,114 @@ describe('ResultWaiter', () => {
     expect(reads).not.toContain('later');
     await Promise.all(waits);
   });
+
+  it('ends a wait that closes while its read is in flight, without waiting for the store', async () => {
+    let reads = 0;
+    const waiter = new ResultWaiter<string>({
+      read: () => (reads++, new Promise(() => undefined)), // a store that never answers
+      closedError: (id) => new Error(`closed while waiting for ${id}`),
+    });
+    const result = waiter.wait('report').catch((error: Error) => error.message);
+    await Promise.resolve();
+    expect(reads).toBe(1);
+
+    await waiter.close();
+    expect(await result).toBe('closed while waiting for report');
+    expect(reads).toBe(1);
+  });
+
+  it('ends a wait settled during its backoff, without reading again', async () => {
+    let reads = 0;
+    const waiter = new ResultWaiter<string>({ read: async () => (reads++, null) });
+    const result = waiter.wait('report');
+    await new Promise((resolve) => setTimeout(resolve, 10)); // mid-backoff: the first read answered null
+    expect(reads).toBe(1);
+
+    waiter.settle('report', { value: 'ready' });
+    await expect(result).resolves.toBe('ready');
+    expect(reads).toBe(1);
+  });
+
+  it('answers with the outcome it was settled with, not the closed error, when both land together', async () => {
+    const waiter = new ResultWaiter<string>({
+      read: () => new Promise(() => undefined),
+      closedError: (id) => new Error(`closed while waiting for ${id}`),
+    });
+    const result = waiter.wait('report');
+    await Promise.resolve();
+
+    waiter.settle('report', { value: 'ready' });
+    await waiter.close();
+    await expect(result).resolves.toBe('ready');
+  });
+
+  it('keeps nothing for an id once its wait ended, however it ended', async () => {
+    const outcomes: Record<string, ResultOutcome<string> | null> = { done: { value: 'PDF-1' } };
+    const waiter = new ResultWaiter<string>({
+      read: (id) => {
+        if (id === 'broken') return Promise.reject(new Error('connection terminated'));
+        if (id === 'exploding') throw new Error('no client in the pool');
+        return Promise.resolve(outcomes[id] ?? null);
+      },
+    });
+
+    await expect(waiter.wait('done')).resolves.toBe('PDF-1');
+    await expect(waiter.wait('broken')).rejects.toThrow('connection terminated');
+    await expect(waiter.wait('exploding')).rejects.toThrow('no client in the pool');
+    await expect(waiter.wait('slow', { timeout: '20ms' })).rejects.toThrow('"slow" didn\'t end within 20ms.');
+
+    // settle() only calls its function when something still waits for the id: nothing does, for any of these.
+    let computed = 0;
+    for (const id of ['done', 'broken', 'exploding', 'slow']) {
+      waiter.settle(id, () => (computed++, { value: 'late' }));
+    }
+    expect(computed).toBe(0);
+  });
+
+  it('gives up once the read in flight answers, when its deadline passed while it was out', async () => {
+    let reads = 0;
+    const waiter = new ResultWaiter<string>({
+      read: () => (reads++, new Promise((resolve) => setTimeout(() => resolve(null), 50))),
+    });
+    const started = performance.now();
+
+    await expect(waiter.wait('slow', { timeout: '20ms' })).rejects.toThrow('"slow" didn\'t end within 20ms.');
+    // The read isn't cancelled: the wait gives up on the loop's next turn, late rather than never.
+    expect(reads).toBe(1);
+    expect(performance.now() - started).toBeGreaterThanOrEqual(45);
+  });
+
+  it('keeps nothing per read while a wait goes on, however long it waits', async () => {
+    let reads = 0;
+    const waiter = new ResultWaiter<string>({ read: async () => (reads++, null) });
+    // Only the backoff's sleeps are faked: the wait reads 20,000 times in a moment, each read answering in turn.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const result = waiter.wait('report').catch((error: Error) => error.message);
+    /** Lets the wait read `n` more times, or says where it stopped reading. */
+    const polls = async (n: number) => {
+      const until = reads + n;
+      for (let turns = 0; reads < until; turns++) {
+        if (turns > n * 2 + 1_000) {
+          throw new Error(`the wait stopped reading at ${reads} of ${until}`);
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+        vi.advanceTimersByTime(1_000);
+      }
+    };
+
+    let kept: number;
+    try {
+      await polls(100);
+      const before = heapUsed();
+      await polls(20_000);
+      kept = heapUsed() - before;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    await waiter.close();
+    expect(await result).toBe('The waiter closed while waiting for the result of "report".');
+    // Each read used to race a promise that lived as long as the wait: about 300 bytes a read, 6 MB here.
+    expect(kept).toBeLessThan(1_000_000);
+  }, 30_000);
 });

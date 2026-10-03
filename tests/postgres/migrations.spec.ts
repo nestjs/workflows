@@ -14,6 +14,7 @@ import pg from 'pg';
 import type { SqlExecutor as AnySqlExecutor } from '@nestjs/store-kit';
 import { fromDrizzle, fromPg, PostgresWorkflowStore, WorkflowSchemaError, type SqlExecutor, type SqlTransaction } from '../../lib/postgres/index.js';
 import { workflowStoreSchema } from '../../lib/postgres/migrations/index.js';
+import { endPool } from '../support/postgres.js';
 import { testDatabase } from './support.js';
 
 const { database, reason } = await testDatabase('pgstore_migrations');
@@ -27,8 +28,11 @@ const onPostgres = () =>
     }
   });
 
+// endPool, not pool.end(): end() resolves once each client has been asked to go, not once its socket has. The
+// database is dropped WITH (FORCE) right after this hook, which terminates whatever backend is still attached, and
+// a client ending at that moment gets the FATAL with nothing listening for it — an unhandled error, and a red run.
 afterAll(async () => {
-  await Promise.all(pools.map((pool) => pool.end()));
+  await Promise.all(pools.map((pool) => endPool(pool)));
 });
 
 /** A pool of its own, as each process has. */

@@ -9,7 +9,7 @@ const SETTLED = Symbol('settled');
 interface Wait<T> {
   outcome?: ResultOutcome<T>;
   closed: boolean;
-  /** Resolves the read it races, so a local outcome or the close needn't wait for the store. */
+  /** Resolves the promise the read in flight races, so a local outcome or the close needn't wait for the store. Each read replaces it. */
   settle(): void;
   /** Ends the backoff's sleep early. */
   wake?: () => void;
@@ -62,13 +62,11 @@ export class ResultWaiter<T = unknown> {
     const deadline = performance.now() + timeoutMs;
     options.signal?.throwIfAborted();
 
-    let settle!: () => void;
-    const settled = new Promise<typeof SETTLED>((resolve) => (settle = () => resolve(SETTLED)));
-    const wait: Wait<T> = { closed: this.closed, settle };
+    const wait: Wait<T> = { closed: this.closed, settle: () => undefined };
     const nudge = () => wait.wake?.();
     const close = () => {
       wait.closed = true;
-      settle();
+      wait.settle();
       nudge();
     };
     this.add(id, wait);
@@ -77,7 +75,7 @@ export class ResultWaiter<T = unknown> {
 
     try {
       for (let delay = 25; ; delay = Math.min(delay * 2, 1_000)) {
-        const read = wait.outcome || wait.closed ? SETTLED : await Promise.race([this.options.read(id), settled]);
+        const read = wait.outcome || wait.closed ? SETTLED : await this.readOrGiveWay(id, wait);
         if (wait.outcome) {
           return unwrap(wait.outcome);
         }
@@ -135,6 +133,16 @@ export class ResultWaiter<T = unknown> {
   async close(): Promise<void> {
     this.closing.abort();
     await nextMacrotask();
+  }
+
+  /**
+   * Reads `id`, or gives way when `wait` settles or closes first. Each read races a promise of its own: a race stays
+   * subscribed to a promise until that settles, so one promise for the whole wait would keep every read's race.
+   * Not `read`: a private member of that name would stop a subclass declaring one of its own.
+   */
+  private readOrGiveWay(id: string, wait: Wait<T>): Promise<ResultOutcome<T> | null | typeof SETTLED> {
+    const givenWay = new Promise<typeof SETTLED>((resolve) => (wait.settle = () => resolve(SETTLED)));
+    return Promise.race([this.options.read(id), givenWay]);
   }
 
   private add(id: string, wait: Wait<T>): void {

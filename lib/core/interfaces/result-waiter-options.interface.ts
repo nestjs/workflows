@@ -27,7 +27,9 @@ export type ResultOutcome<T> = { value: T } | { error: unknown };
 export interface ResultWaiterOptions<T> {
   /**
    * Reads the outcome from the store: `null` while it hasn't ended. Called when a wait starts, then after a backoff
-   * (25 ms at first, doubling up to a second), until the wait ends; a rejection rejects the wait.
+   * (25 ms at first, doubling up to a second), until the wait ends; a rejection rejects the wait. A wait's `timeout`
+   * and `signal` are only checked between reads, so a read that never answers holds the wait open: give it a timeout
+   * of its own.
    */
   read(id: string): Promise<ResultOutcome<T> | null>;
   /** The error a wait rejects with past its `timeout`. Default: an `Error` that names `id`. */
