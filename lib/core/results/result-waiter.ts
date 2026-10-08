@@ -9,8 +9,8 @@ const SETTLED = Symbol('settled');
 interface Wait<T> {
   outcome?: ResultOutcome<T>;
   closed: boolean;
-  /** Resolves the read it races, so a local outcome or the close needn't wait for the store. */
-  settle(): void;
+  /** Resolves the read in flight, so a local outcome or the close needn't wait for the store. */
+  settle?: () => void;
   /** Ends the backoff's sleep early. */
   wake?: () => void;
 }
@@ -62,13 +62,11 @@ export class ResultWaiter<T = unknown> {
     const deadline = performance.now() + timeoutMs;
     options.signal?.throwIfAborted();
 
-    let settle!: () => void;
-    const settled = new Promise<typeof SETTLED>((resolve) => (settle = () => resolve(SETTLED)));
-    const wait: Wait<T> = { closed: this.closed, settle };
+    const wait: Wait<T> = { closed: this.closed };
     const nudge = () => wait.wake?.();
     const close = () => {
       wait.closed = true;
-      settle();
+      wait.settle?.();
       nudge();
     };
     this.add(id, wait);
@@ -77,7 +75,7 @@ export class ResultWaiter<T = unknown> {
 
     try {
       for (let delay = 25; ; delay = Math.min(delay * 2, 1_000)) {
-        const read = wait.outcome || wait.closed ? SETTLED : await Promise.race([this.options.read(id), settled]);
+        const read = wait.outcome || wait.closed ? SETTLED : await this.read(id, wait);
         if (wait.outcome) {
           return unwrap(wait.outcome);
         }
@@ -122,7 +120,7 @@ export class ResultWaiter<T = unknown> {
     const settled = typeof outcome === 'function' ? outcome() : outcome;
     for (const wait of waits) {
       wait.outcome ??= settled;
-      wait.settle();
+      wait.settle?.();
       wait.wake?.();
     }
   }
@@ -135,6 +133,19 @@ export class ResultWaiter<T = unknown> {
   async close(): Promise<void> {
     this.closing.abort();
     await nextMacrotask();
+  }
+
+  /**
+   * Reads `id`, unless the wait settles first. It races a promise of its own, not one the whole wait shares: each
+   * race leaves a reaction on its inputs until they settle, so a shared one would keep one per poll.
+   */
+  private async read(id: string, wait: Wait<T>): Promise<ResultOutcome<T> | null | typeof SETTLED> {
+    const settled = new Promise<typeof SETTLED>((resolve) => (wait.settle = () => resolve(SETTLED)));
+    try {
+      return await Promise.race([this.options.read(id), settled]);
+    } finally {
+      wait.settle = undefined;
+    }
   }
 
   private add(id: string, wait: Wait<T>): void {
