@@ -55,8 +55,8 @@ export class LeasedWorker<T> {
   /** Claims in flight: shutdown waits for them, so nothing they claim starts unobserved. */
   private readonly claiming = new Set<Promise<unknown>>();
   private stopped = false;
-  private stop!: () => void;
-  private readonly stoppedPromise = new Promise<void>((resolve) => (this.stop = resolve));
+  /** Ends the `drain()` rounds waiting now, at shutdown. */
+  private readonly stopping = new Set<() => void>();
   private wake?: () => void;
   private kicked = false;
   private loop?: Promise<void>;
@@ -119,7 +119,7 @@ export class LeasedWorker<T> {
       }
 
       total += executions.length;
-      await Promise.race([Promise.all(executions), this.stoppedPromise]);
+      await this.untilStopped(Promise.all(executions));
     }
 
     return total;
@@ -135,7 +135,9 @@ export class LeasedWorker<T> {
     }
 
     this.stopped = true;
-    this.stop();
+    for (const stop of this.stopping) {
+      stop();
+    }
     this.wake?.();
 
     // What a claim in flight claims starts now, told to stop at once, so it is handed back before the store closes.
@@ -155,6 +157,24 @@ export class LeasedWorker<T> {
       run.detach();
     }
     await this.loop;
+  }
+
+  /**
+   * Waits for `work`, or until shutdown. It races a promise of its own, not one the worker keeps: each race leaves a
+   * reaction on its inputs until they settle, so a long-lived one would keep one per round.
+   */
+  private async untilStopped(work: Promise<unknown>): Promise<void> {
+    let stop!: () => void;
+    const stopped = new Promise<void>((resolve) => (stop = resolve));
+    if (this.stopped) {
+      stop();
+    }
+    this.stopping.add(stop);
+    try {
+      await Promise.race([work, stopped]);
+    } finally {
+      this.stopping.delete(stop);
+    }
   }
 
   private async poll(): Promise<void> {
