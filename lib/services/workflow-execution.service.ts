@@ -271,8 +271,6 @@ export class WorkflowExecution {
   private readonly childCounters = new Map<string, number>();
   /** The first interrupt that stops this execution (not a suspension). */
   private stoppedBy: WorkflowInterrupt | null = null;
-  /** The step whose function is running, in that function's async context. */
-  private readonly insideStep = new AsyncLocalStorage<string>();
   /** Each journal entry's size in bytes, by name, and their sum. */
   private readonly entrySizes = new Map<string, number>();
   private journalBytes = 0;
@@ -1043,7 +1041,7 @@ export class WorkflowExecution {
       },
     };
 
-    const run = Promise.resolve().then(() => runInStepScope(ctx.idempotencyKey, () => this.insideStep.run(name, () => fn(ctx))));
+    const run = Promise.resolve().then(() => runInStepScope(ctx.idempotencyKey, () => insideStep.run({ execution: this, name, outer: insideStep.getStore() }, () => fn(ctx))));
     return Promise.race([run, watchdog]).finally(() => {
       settled = true;
       clearTimeout(overall);
@@ -1083,10 +1081,15 @@ export class WorkflowExecution {
    * replay, so it is a definition error, reported where it happens.
    */
   private assertNotInStep(call: string, advice = 'Call ctx methods from run() and pass the values the step needs into it.'): void {
-    const step = this.insideStep.getStore();
-    if (step === undefined) {
+    let frame = insideStep.getStore();
+    while (frame && frame.execution !== this) {
+      frame = frame.outer;
+    }
+    if (!frame) {
       return;
     }
+
+    const step = frame.name;
 
     const where = step.startsWith(COMPENSATE) ? `the compensation of step "${step.slice(COMPENSATE.length)}"` : `step "${step}"`;
     throw this.setFatal(
@@ -1402,6 +1405,19 @@ function conditionsOf(name: string, conditions: Record<string, unknown>): Map<st
 }
 
 const COMPENSATE = '$compensate:';
+
+/** A step whose function is running, and the one it runs inside of (a step of another execution), if any. */
+interface StepFrame {
+  execution: WorkflowExecution;
+  name: string;
+  outer?: StepFrame;
+}
+
+/**
+ * The steps whose functions are running, in their async context. One store for every execution, not one each: on
+ * Node 20 and 22, a store that ran stays in a process-wide list every async resource walks, until `disable()`.
+ */
+const insideStep = new AsyncLocalStorage<StepFrame>();
 const PARENT_CLOSE: WorkflowParentClose[] = ['cancel', 'terminate', 'abandon'];
 
 /** The most a custom status (`ctx.setStatus()`) may take as JSON. */
