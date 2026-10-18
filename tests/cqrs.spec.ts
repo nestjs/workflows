@@ -490,6 +490,28 @@ describe('the publisher', () => {
     ]);
     expect(order.getUncommittedEvents()).toEqual([]);
   });
+
+  it('rejects publishAll() in a transaction with the first failed write once every write has settled, also one that throws', async () => {
+    const app = await boot({ workflows: [OrderFulfilmentWorkflow], providers: shared() });
+    const tx = { name: 'a Drizzle tx' };
+    await app.eventBus.publish(new OrderPlacedEvent('o-1', 2499), { transaction: tx });
+    const unhandled: unknown[] = [];
+    const record = (reason: unknown) => void unhandled.push(reason);
+    process.on('unhandledRejection', record);
+
+    try {
+      // The first start rejects once the store answers (its id is taken with another input), and the second throws
+      // before it returns, as start() does in a transaction (a BigInt in its input): the first is still waited for.
+      await expect(
+        app.eventBus.publishAll([new OrderPlacedEvent('o-1', 1599), new OrderPlacedEvent('o-2', 10n as never)], { transaction: tx }),
+      ).rejects.toThrow(WorkflowIdConflictError);
+      // Node reports a rejection nobody handled once the microtasks have run.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', record);
+    }
+  });
 });
 
 // Type checks only (tsc runs over tests/): never called.

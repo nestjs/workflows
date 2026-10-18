@@ -136,8 +136,9 @@ export class WorkflowEventPublisher implements IEventPublisher, OnModuleInit, On
 
     // Issued back to back, not awaited in between: a driver whose transactions are synchronous
     // must see every statement before the application's callback returns, and on the
-    // transaction's one connection they still run in this order.
-    const settled = await Promise.allSettled(writes.map((write) => write.run(transaction)));
+    // transaction's one connection they still run in this order. A write that throws (start()
+    // and signal() do in a transaction) is settled with the others, as one that rejects.
+    const settled = await Promise.allSettled(writes.map(async (write) => write.run(transaction)));
     const index = settled.findIndex((result) => result.status === 'rejected');
     if (index !== -1) {
       failure.event = writes[index].event;

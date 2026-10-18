@@ -1,3 +1,4 @@
+import type { Maybe } from '../core/utils/maybe.util.js';
 import type { SerializedWorkflowError } from './serialized-workflow-error.interface.js';
 import type { WorkflowRateWindow } from './workflow-decorator-options.interface.js';
 import type {
@@ -41,9 +42,12 @@ export interface WorkflowStore {
    * hands its transaction callback (a Drizzle `tx`, a TypeORM `EntityManager`...). Write only
    * through it, so the instance commits or rolls back with the application's rows, and never
    * catch a database error inside it (on PostgreSQL that aborts the transaction: use
-   * insert-or-ignore). Without this method, `start()` with a transaction throws.
+   * insert-or-ignore). Without this method, `start()` with a transaction throws. On a driver
+   * whose transactions are synchronous (better-sqlite3), return the result itself, not a
+   * promise, so `start()` can throw before the application's callback returns: the callback
+   * can't await it, and its transaction commits unless it throws.
    */
-  createInTransaction?(transaction: unknown, instance: NewWorkflowInstance): Promise<{ instance: WorkflowInstance; created: boolean }>;
+  createInTransaction?(transaction: unknown, instance: NewWorkflowInstance): Maybe<{ instance: WorkflowInstance; created: boolean }>;
   /**
    * The instance with the waits its last suspension registered (`[]` when none), and its
    * journal when `options.journal` is set, or `null` for an unknown id.
@@ -107,7 +111,7 @@ export interface WorkflowStore {
    * transaction must be READ COMMITTED, or the wake-up can miss waits committed after its
    * snapshot: refuse other isolation levels.
    */
-  signalInTransaction?(transaction: unknown, signal: NewWorkflowSignal): Promise<WorkflowSignalResult>;
+  signalInTransaction?(transaction: unknown, signal: NewWorkflowSignal): Maybe<WorkflowSignalResult>;
   /** Signals named `name` with exactly `key` and `afterId < id <= upToId`, by id. */
   signals(query: WorkflowSignalQuery): Promise<WorkflowSignalRecord[]>;
 

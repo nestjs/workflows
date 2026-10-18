@@ -46,13 +46,14 @@ export class EncodedWorkflowStore implements WorkflowInstanceStore {
     readonly codecs: PayloadCodecs<WorkflowPayloadContext>,
   ) {
     // Only when the store has them: the client tells a store that can't join transactions by their absence.
-    // Nothing is awaited before the store's call when the codec is synchronous (see WorkflowClient.start()).
+    // Nothing is awaited before the store's call when the codec is synchronous, nor after it when the store returns at
+    // once and there is nothing to decode (see WorkflowClient.start()).
     if (typeof inner.createInTransaction === 'function') {
       this.createInTransaction = (transaction, instance) =>
         this.instanceOf(andThen(this.encodeNew(instance), (encoded) => inner.createInTransaction!(transaction, encoded)));
     }
     if (typeof inner.signalInTransaction === 'function') {
-      this.signalInTransaction = (transaction, signal) => toPromise(andThen(this.encodeSignal(signal), (encoded) => inner.signalInTransaction!(transaction, encoded)));
+      this.signalInTransaction = (transaction, signal) => andThen(this.encodeSignal(signal), (encoded) => inner.signalInTransaction!(transaction, encoded));
     }
     // Keys aren't encoded: the store checks them as they are.
     if (typeof inner.checkKey === 'function') {
@@ -79,7 +80,7 @@ export class EncodedWorkflowStore implements WorkflowInstanceStore {
   };
 
   create(instance: NewWorkflowInstance) {
-    return this.instanceOf(andThen(this.encodeNew(instance), (encoded) => this.inner.create(encoded)));
+    return toPromise(this.instanceOf(andThen(this.encodeNew(instance), (encoded) => this.inner.create(encoded))));
   }
 
   async get(id: string, options?: { journal?: boolean }): Promise<WorkflowInstanceDetails | null> {
@@ -261,7 +262,7 @@ export class EncodedWorkflowStore implements WorkflowInstanceStore {
   }
 
   private async decodeInstance<T extends WorkflowInstance>(instance: T): Promise<T> {
-    if (![instance.input, instance.output, instance.error?.message, instance.customStatus, instance.cancelReason].some(encoded)) {
+    if (!instanceEncoded(instance)) {
       return instance;
     }
 
@@ -276,9 +277,13 @@ export class EncodedWorkflowStore implements WorkflowInstanceStore {
     return { ...instance, input, ...('output' in instance ? { output } : {}), error, customStatus, cancelReason: cancelReason as string | null };
   }
 
-  private async instanceOf(stored: Maybe<{ instance: WorkflowInstance; created: boolean }>): Promise<{ instance: WorkflowInstance; created: boolean }> {
-    const { instance, created } = await stored;
-    return { instance: await this.decodeInstance(instance), created };
+  private instanceOf(stored: Maybe<{ instance: WorkflowInstance; created: boolean }>): Maybe<{ instance: WorkflowInstance; created: boolean }> {
+    return andThen(stored, ({ instance, created }) => {
+      // At once when there is nothing to decode: with a store that returns at once, start() checks the instance it
+      // found under the id before the application's transaction callback returns.
+      const decoded = instanceEncoded(instance) ? this.decodeInstance(instance) : instance;
+      return andThen(decoded, (readable) => ({ instance: readable, created }));
+    });
   }
 
   /**
@@ -298,6 +303,10 @@ export class EncodedWorkflowStore implements WorkflowInstanceStore {
     }
     return decoded;
   }
+}
+
+function instanceEncoded(instance: WorkflowInstance): boolean {
+  return [instance.input, instance.output, instance.error?.message, instance.customStatus, instance.cancelReason].some(encoded);
 }
 
 function entryEncoded(entry: WorkflowJournalEntry): boolean {

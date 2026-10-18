@@ -4,6 +4,7 @@ import { ResultWaiter } from '../core/results/result-waiter.js';
 import type { ResultOutcome } from '../core/interfaces/result-waiter-options.interface.js';
 import { systemClock } from '../core/time/clock.js';
 import { parseDuration } from '../core/time/duration.js';
+import { andThen, toPromise, type Maybe } from '../core/utils/maybe.util.js';
 import { runTimeoutMs } from '../utils/run-timeout.util.js';
 import type { WorkflowClock } from '../interfaces/workflow-clock.interface.js';
 import { WorkflowIdConflictError } from '../errors/workflow-id-conflict.error.js';
@@ -106,9 +107,21 @@ export class WorkflowClient implements BeforeApplicationShutdown {
    * retried step gets its instance back instead of starting another. An id, a
    * key or an input string the store can't keep (`WorkflowStore.unstorableText()`:
    * U+0000 on PostgreSQL, a lone UTF-16 surrogate in JSON on PostgreSQL and MySQL)
-   * is refused with a `TypeError`.
+   * is refused with a `TypeError`. With `transaction`, a failure is thrown before
+   * `start()` returns unless something asynchronous comes first (the store, a
+   * codec, or decoding the stored instance when a codec encoded it): on a driver
+   * whose transactions are synchronous, your transaction callback can't await
+   * `start()`, and rolls back only when it throws.
    */
-  async start<W>(workflow: Type<W> | string, input: WorkflowInput<W>, options: StartWorkflowOptions = {}): Promise<WorkflowStartResult> {
+  start<W>(workflow: Type<W> | string, input: WorkflowInput<W>, options: StartWorkflowOptions = {}): Promise<WorkflowStartResult> {
+    return promised(options.transaction, () => this.create(workflow, input, options));
+  }
+
+  /**
+   * `start()`'s work: synchronous up to the store's call when the codec is, and past it when the store is too and the
+   * instance it returns has nothing encoded.
+   */
+  private create<W>(workflow: Type<W> | string, input: WorkflowInput<W>, options: StartWorkflowOptions): Maybe<WorkflowStartResult> {
     const resolved = this.registry.resolve(workflow as Type<unknown> | string, options.version);
     const derived = options.id === undefined ? stepStartId(resolved.name) : undefined;
     const id = options.id ?? derived ?? randomUUID();
@@ -121,21 +134,23 @@ export class WorkflowClient implements BeforeApplicationShutdown {
       rateLimitKey: options.rateLimitKey,
       priority: options.priority,
     });
-    // Nothing is awaited before the store's call: on a driver whose transactions are
-    // synchronous, its statements must run before the application's transaction callback returns.
-    const { instance, created } = await (options.transaction === undefined
-      ? this.store.create(data)
-      : this.storeMethod('createInTransaction', 'start')(options.transaction, data));
+    // Nothing is awaited before the store's call, nor after it when the store returns at once: on a driver whose
+    // transactions are synchronous, its statements must run, and an id conflict must throw, before the application's
+    // transaction callback returns.
+    const stored =
+      options.transaction === undefined ? this.store.create(data) : this.storeMethod('createInTransaction', 'start')(options.transaction, data);
 
-    if (!created) {
-      // A retried step may build its input anew (a timestamp in it, say): with an id derived
-      // from the step, the first input wins.
-      assertSameInstance(instance, data, { input: derived === undefined, parent: false });
-    } else {
-      this.worker.kick();
-    }
+    return andThen(stored, ({ instance, created }) => {
+      if (!created) {
+        // A retried step may build its input anew (a timestamp in it, say): with an id derived
+        // from the step, the first input wins.
+        assertSameInstance(instance, data, { input: derived === undefined, parent: false });
+      } else {
+        this.worker.kick();
+      }
 
-    return { id: data.id, workflow: data.workflow, version: instance.version, created, status: instance.status };
+      return { id: data.id, workflow: data.workflow, version: instance.version, created, status: instance.status };
+    });
   }
 
   /**
@@ -295,13 +310,16 @@ export class WorkflowClient implements BeforeApplicationShutdown {
    * signal and the wake-ups commit or roll back with your transaction. With
    * `id`, or from inside a workflow step, a repeated signal is stored once.
    * A name, key, id or payload string the store can't keep is refused with a
-   * `TypeError`, as in `start()`.
+   * `TypeError`, as in `start()`. With `transaction`, a failure is thrown
+   * before `signal()` returns unless something asynchronous comes first (the
+   * store, a codec).
    */
-  async signal<T>(
-    signal: WorkflowSignal<T> | string,
-    payload: NoInfer<T>,
-    options: SignalWorkflowOptions = {},
-  ): Promise<WorkflowSignalSendResult> {
+  signal<T>(signal: WorkflowSignal<T> | string, payload: NoInfer<T>, options: SignalWorkflowOptions = {}): Promise<WorkflowSignalSendResult> {
+    return promised(options.transaction, () => this.send(signal, payload, options));
+  }
+
+  /** `signal()`'s work, as `create()` is `start()`'s. */
+  private send<T>(signal: WorkflowSignal<T> | string, payload: NoInfer<T>, options: SignalWorkflowOptions): Maybe<WorkflowSignalSendResult> {
     const name = signalName(signal);
     const key = options.key ?? null;
     if (options.id !== undefined && (typeof options.id !== 'string' || options.id.length === 0)) {
@@ -316,21 +334,22 @@ export class WorkflowClient implements BeforeApplicationShutdown {
     const json = normalize(payload);
     assertStorableJson('Signal payload', json, this.store.textCheck('payload'));
     const data = { name, key, dedupeId, payload: json, now: this.clock.now() };
-    // Nothing is awaited before the store's call, as in start().
-    const result = await (options.transaction === undefined
-      ? this.store.signal(data)
-      : this.storeMethod('signalInTransaction', 'signal')(options.transaction, data));
+    // Nothing is awaited before the store's call, nor after it when the store returns at once, as in start().
+    const sent =
+      options.transaction === undefined ? this.store.signal(data) : this.storeMethod('signalInTransaction', 'signal')(options.transaction, data);
 
-    if (!result.created && result.key !== key) {
-      throw new WorkflowIdConflictError(
-        `Signal id "${dedupeId}" of "${name}" was already used with ${describeKey(result.key)}, not ${describeKey(key)}.`,
-      );
-    }
-    if (result.woken > 0) {
-      this.worker.kick();
-    }
+    return andThen(sent, (result) => {
+      if (!result.created && result.key !== key) {
+        throw new WorkflowIdConflictError(
+          `Signal id "${dedupeId}" of "${name}" was already used with ${describeKey(result.key)}, not ${describeKey(key)}.`,
+        );
+      }
+      if (result.woken > 0) {
+        this.worker.kick();
+      }
 
-    return { signalId: result.id, woken: result.woken, created: result.created };
+      return { signalId: result.id, woken: result.woken, created: result.created };
+    });
   }
 
   /**
@@ -537,4 +556,20 @@ const ALL: WorkflowStatus[] = ['pending', 'running', 'suspended', 'compensating'
 
 function describeKey(key: string | null): string {
   return key === null ? 'no key' : `key "${key}"`;
+}
+
+/**
+ * `work()`'s result as a promise, rejected with what it throws, as from an async method, except in the application's
+ * transaction: there what it throws is thrown, before the call returns. A driver whose transactions are synchronous
+ * (better-sqlite3) runs the transaction callback without awaiting what it returns, and commits unless it throws.
+ */
+function promised<T>(transaction: unknown, work: () => Maybe<T>): Promise<T> {
+  try {
+    return toPromise(work());
+  } catch (error) {
+    if (transaction !== undefined) {
+      throw error;
+    }
+    return Promise.reject(error);
+  }
 }

@@ -12,10 +12,12 @@ import {
   WorkflowIdConflictError,
   WorkflowsModule,
   WorkflowStorage,
+  type NewWorkflowInstance,
+  type NewWorkflowSignal,
   type WorkflowContext,
   type WorkflowStore,
 } from '../lib/index.js';
-import { boot, storeKind, tempDb, type Node, type TestDb } from './support.js';
+import { boot, openStore, storeKind, tempDb, type Node, type TestDb } from './support.js';
 
 let db: TestDb;
 let clock: ManualWorkflowClock;
@@ -426,11 +428,11 @@ describe.runIf(storeKind === 'memory')('transactions on a store without the opti
     const client = moduleRef.get(WorkflowClient);
 
     try {
-      await expect(client.start(Echo, {}, { id: 'tx', transaction: {} })).rejects.toThrow(
+      expect(() => client.start(Echo, {}, { id: 'tx', transaction: {} })).toThrow(
         'start() with { transaction } needs a WorkflowStore on your database that implements createInTransaction(); ' +
           'BareStore has none. See https://docs.nestjs.com/reliability/workflows#the-store-contract.',
       );
-      await expect(client.signal('value', 1, { transaction: {} })).rejects.toThrow(
+      expect(() => client.signal('value', 1, { transaction: {} })).toThrow(
         'signal() with { transaction } needs a WorkflowStore on your database that implements signalInTransaction(); BareStore has none.',
       );
 
@@ -442,5 +444,157 @@ describe.runIf(storeKind === 'memory')('transactions on a store without the opti
     } finally {
       await moduleRef.close();
     }
+  });
+});
+
+// A store of the test's own: once.
+describe.runIf(storeKind === 'memory')('transactions on a synchronous driver, such as better-sqlite3', () => {
+  /**
+   * The application's database, with better-sqlite3's transactions: `transaction(fn)` runs `fn` at once, and what it
+   * wrote commits if it returns, or rolls back if it throws. A `fn` that returns a promise is refused, as it would
+   * commit before the promise settles: `start()` and `signal()` aren't awaited in it, so their failure rolls the
+   * transaction back only when they throw it before they return.
+   */
+  class Database {
+    orders = new Set<string>();
+    instances = new Map<string, NewWorkflowInstance>();
+    signals: Array<NewWorkflowSignal & { id: number }> = [];
+
+    transaction(fn: (tx: Database) => unknown): void {
+      const tx = Object.assign(new Database(), { orders: new Set(this.orders), instances: new Map(this.instances), signals: [...this.signals] });
+      if (fn(tx) instanceof Promise) {
+        throw new TypeError('Transaction function cannot return a promise');
+      }
+      Object.assign(this, tx);
+    }
+  }
+
+  /** The test database's store, joining such a transaction as a store on that driver does: its writes return at once. */
+  const joinsSynchronously = () =>
+    Object.assign(openStore(db).store, {
+      createInTransaction(tx: Database, instance: NewWorkflowInstance) {
+        const stored = tx.instances.get(instance.id) ?? instance;
+        tx.instances.set(instance.id, stored);
+        // What start() reads of the stored instance.
+        return { instance: { ...stored, status: 'pending' }, created: stored === instance };
+      },
+      signalInTransaction(tx: Database, signal: NewWorkflowSignal) {
+        const earlier = tx.signals.find((s) => signal.dedupeId !== null && s.name === signal.name && s.dedupeId === signal.dedupeId);
+        if (earlier) {
+          return { id: earlier.id, woken: 0, created: false, key: earlier.key };
+        }
+        const id = tx.signals.length + 1;
+        tx.signals.push({ ...signal, id });
+        return { id, woken: 0, created: true, key: signal.key };
+      },
+    });
+
+  /** An application on that store, and its database with order "o-1" placed: its instance started, its payment signalled. */
+  const placed = async () => {
+    joinsSynchronously();
+    const node = await start([Echo]);
+    const database = new Database();
+    const results: Array<Promise<unknown>> = [];
+    database.transaction((tx) => {
+      tx.orders.add('o-1');
+      results.push(node.client.start(Echo, { orderId: 'o-1' }, { id: 'order-o-1', transaction: tx }));
+      results.push(node.client.signal('order.paid', { amount: 2499 }, { key: 'o-1', id: 'charge-1', transaction: tx }));
+    });
+    return { node, database, results: Promise.all(results) };
+  };
+
+  /**
+   * Places order "o-2" with `write` in one transaction: `write` must throw `error` before it returns, so the order rolls
+   * back, and leave no rejection behind for nobody to handle.
+   */
+  const rollsBack = async (database: Database, write: (tx: Database) => unknown, error: string | Error) => {
+    const unhandled: unknown[] = [];
+    const record = (reason: unknown) => void unhandled.push(reason);
+    process.on('unhandledRejection', record);
+    try {
+      expect(() =>
+        database.transaction((tx) => {
+          tx.orders.add('o-2');
+          write(tx);
+        }),
+      ).toThrow(error);
+      expect(database.orders.has('o-2')).toBe(false);
+      // Node reports a rejection nobody handled once the microtasks have run.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', record);
+    }
+  };
+
+  it('runs start() and signal() in the transaction, so what they write commits with its rows', async () => {
+    const { database, results } = await placed();
+
+    expect(await results).toEqual([
+      { id: 'order-o-1', workflow: 'echo', version: 1, created: true, status: 'pending' },
+      { signalId: 1, woken: 0, created: true },
+    ]);
+    expect([...database.orders]).toEqual(['o-1']);
+    expect([...database.instances.keys()]).toEqual(['order-o-1']);
+    expect(database.signals).toMatchObject([{ id: 1, name: 'order.paid', key: 'o-1', dedupeId: 'charge-1' }]);
+  });
+
+  const full = new Error('SQLITE_FULL: database or disk is full');
+  it.each([
+    {
+      call: 'start() with an input that is not JSON',
+      write: (node: Node, tx: Database) => node.client.start(Echo, { amount: 10n }, { id: 'order-o-2', transaction: tx }),
+      error: new TypeError('Do not know how to serialize a BigInt'),
+    },
+    {
+      call: 'signal() with a payload that is not JSON',
+      write: (node: Node, tx: Database) => node.client.signal('order.paid', { amount: 10n }, { key: 'o-2', transaction: tx }),
+      error: new TypeError('Do not know how to serialize a BigInt'),
+    },
+    {
+      call: 'start() with a conflicting id',
+      write: (node: Node, tx: Database) => node.client.start(Echo, { orderId: 'o-2' }, { id: 'order-o-1', transaction: tx }),
+      error: new WorkflowIdConflictError('Instance "order-o-1" of "echo" already exists with a different input.'),
+    },
+    {
+      call: 'signal() with a conflicting id',
+      write: (node: Node, tx: Database) => node.client.signal('order.paid', { amount: 2499 }, { key: 'o-2', id: 'charge-1', transaction: tx }),
+      error: new WorkflowIdConflictError('Signal id "charge-1" of "order.paid" was already used with key "o-1", not key "o-2".'),
+    },
+    {
+      call: 'start() on a full disk',
+      write: (node: Node, tx: Database) => {
+        vi.spyOn(node.store, 'createInTransaction').mockImplementationOnce(() => {
+          throw full;
+        });
+        return node.client.start(Echo, { orderId: 'o-2' }, { id: 'order-o-2', transaction: tx });
+      },
+      error: full,
+    },
+    {
+      call: 'signal() on a full disk',
+      write: (node: Node, tx: Database) => {
+        vi.spyOn(node.store, 'signalInTransaction').mockImplementationOnce(() => {
+          throw full;
+        });
+        return node.client.signal('order.paid', { amount: 2499 }, { key: 'o-2', transaction: tx });
+      },
+      error: full,
+    },
+  ])('$call throws before it returns, so the transaction rolls back', async ({ write, error }) => {
+    const { node, database } = await placed();
+
+    await rollsBack(database, (tx) => write(node, tx), error);
+    expect([...database.instances.keys()]).toEqual(['order-o-1']);
+    expect(database.signals).toHaveLength(1);
+  });
+
+  it("throws before start() and signal() return when the store can't join the transaction, so it rolls back", async () => {
+    Object.assign(openStore(db).store, { createInTransaction: undefined, signalInTransaction: undefined });
+    const node = await start([Echo]);
+    const database = new Database();
+
+    await rollsBack(database, (tx) => node.client.start(Echo, {}, { id: 'order-o-2', transaction: tx }), 'implements createInTransaction()');
+    await rollsBack(database, (tx) => node.client.signal('order.paid', 1, { transaction: tx }), 'implements signalInTransaction()');
   });
 });
