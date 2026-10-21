@@ -19,7 +19,7 @@ export interface MySqlWorkflowStoreOptions {
    * Apply the store's pending migrations at startup, one statement at a time under a lock (`GET_LOCK()`), so processes
    * that start together migrate once, and a run that stopped halfway resumes where it stopped. With `false`, startup
    * fails with a `WorkflowSchemaError` while the schema is behind this version of the package: apply them with
-   * `npx nest-workflows migrate`, or with your own migration tool (`MySqlWorkflowStore.migrationSql()` or
+   * `npx @nestjs/workflows migrate`, or with your own migration tool (`MySqlWorkflowStore.migrationSql()` or
    * `migrationStatements()`). Default: `true`, except when `NODE_ENV` is `production`.
    */
   migrate?: boolean;
