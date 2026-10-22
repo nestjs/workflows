@@ -51,6 +51,7 @@
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "format": "prettier --write \"**/*.ts\"",
     "lint": "oxlint lib/",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "generate:prisma": "prisma generate --config tests/fixtures/prisma/prisma.config.ts && prisma generate --config tests/fixtures/prisma-mysql/prisma.config.ts",
     "prepublish:npm": "npm run build",
     "publish:npm": "npm publish --access public",
