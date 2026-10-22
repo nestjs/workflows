@@ -40,15 +40,15 @@ describe('nest-workflows', () => {
   it('prints its usage for --help, and on stderr, exiting with 1, for no command, an unknown one or an unknown option', async () => {
     const help = await run(['--help']);
     expect(help).toMatchObject({ code: 0, err: '' });
-    expect(help.out).toMatch(/^Usage: nest-workflows <command> \[options\]/);
+    expect(help.out).toMatch(/^Usage: npx @nestjs\/workflows <command> \[options\]/);
     expect(await run([])).toEqual({ code: 1, out: '', err: help.out });
     expect(await run(['upgrade'])).toEqual({ code: 1, out: '', err: `Unknown command "upgrade".\n\n${help.out}` });
     expect((await run(['sql', '--verbose'])).err).toMatch(/^Unknown option '--verbose'/);
   });
 
   it('needs the database for migrate and status: --url, else DATABASE_URL', async () => {
-    expect(await run(['migrate'])).toEqual({ code: 1, out: '', err: 'nest-workflows migrate needs the database: pass --url, or set DATABASE_URL.\n' });
-    expect((await run(['status'])).err).toBe('nest-workflows status needs the database: pass --url, or set DATABASE_URL.\n');
+    expect(await run(['migrate'])).toEqual({ code: 1, out: '', err: 'npx @nestjs/workflows migrate needs the database: pass --url, or set DATABASE_URL.\n' });
+    expect((await run(['status'])).err).toBe('npx @nestjs/workflows status needs the database: pass --url, or set DATABASE_URL.\n');
   });
 
   describe('on PostgreSQL', () => {
