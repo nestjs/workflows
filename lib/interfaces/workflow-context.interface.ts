@@ -64,9 +64,9 @@ export interface WorkflowCompensationContext extends WorkflowStepContext {
 export interface WorkflowStepOptions<T> {
   /** Default: the module's `retry` (3 attempts, 1s doubling up to 5m). */
   retry?: number | false | WorkflowRetryOptions;
-  /** Fail the attempt (retryably) after this long. */
+  /** Fail the attempt (retryably) after this long. Capped at about 24.8 days, the longest timer Node supports. */
   timeout?: Duration;
-  /** Fail the attempt (retryably) if `heartbeat()` is not called this often. */
+  /** Fail the attempt (retryably) if `heartbeat()` is not called this often. Capped like `timeout`. */
   heartbeatTimeout?: Duration;
   /**
    * Undo this step, once it completed, if the workflow later fails or is

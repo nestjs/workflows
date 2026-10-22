@@ -253,6 +253,27 @@ describe('LeasedWorker', () => {
     expect(worker.running.map((job) => job.id)).toEqual(['stuck']);
   });
 
+  // Node runs a timer longer than 2^31 - 1 ms (about 24.8 days) after 1 ms instead.
+  it('waits at most as long as a timer can for a heartbeat or a shutdown longer than that, instead of not at all', async () => {
+    const queue = new JobQueue();
+    queue.add('slow');
+    let finished = false;
+    const worker = workerOn(
+      queue,
+      async () => {
+        await sleep(60);
+        finished = true;
+      },
+      { leaseDuration: '90d', heartbeatInterval: '30d', shutdownTimeout: '30d' },
+    );
+
+    void worker.drain();
+    await sleep(5);
+    await worker.shutdown();
+    expect(finished).toBe(true);
+    expect(queue.renewals).toEqual([]);
+  });
+
   it('reports what fails in the loop and carries on, while drain() throws a failed claim', async () => {
     const queue = new JobQueue();
     const errors: Array<[string, string]> = [];

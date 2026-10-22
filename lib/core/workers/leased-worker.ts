@@ -5,6 +5,7 @@ import type { Clock } from '../interfaces/clock.interface.js';
 import type { LeasedRun, LeasedWorkerOptions, LeaseRequest } from '../interfaces/leased-worker-options.interface.js';
 import { systemClock } from '../time/clock.js';
 import { parseDuration } from '../time/duration.js';
+import { setRepeatingTimer, setTimer } from '../utils/timer.util.js';
 
 /**
  * A claim-execute loop under leases, any number of processes sharing a store: it claims due items (as many as it has
@@ -149,7 +150,7 @@ export class LeasedWorker<T> {
     let timer: NodeJS.Timeout | undefined;
     await Promise.race([
       Promise.allSettled([...this.runs].map((run) => run.done)),
-      new Promise((resolve) => (timer = setTimeout(resolve, this.shutdownMs))),
+      new Promise<void>((resolve) => (timer = setTimer(resolve, this.shutdownMs))),
     ]);
     clearTimeout(timer);
 
@@ -216,7 +217,7 @@ export class LeasedWorker<T> {
         this.wake = undefined;
         resolve();
       };
-      const timer = setTimeout(done, this.pollMs);
+      const timer = setTimer(done, this.pollMs);
       this.wake = () => {
         this.kicked = false;
         done();
@@ -249,7 +250,7 @@ export class LeasedWorker<T> {
       run.halt();
     }
 
-    run.heartbeat = setInterval(() => void run.renew(), this.heartbeatMs);
+    run.heartbeat = setRepeatingTimer(() => void run.renew(), this.heartbeatMs);
     run.heartbeat.unref();
     let executing: Promise<void>;
     try {

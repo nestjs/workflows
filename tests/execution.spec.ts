@@ -13,6 +13,7 @@ import {
   WorkflowClient,
   WorkflowError,
   type WorkflowContext,
+  type WorkflowStepOptions,
 } from '../lib/index.js';
 import { boot, forever, tempDb, type Node, type TestDb, World } from './support.js';
 
@@ -555,6 +556,22 @@ describe('step timeouts', () => {
     await node.client.start(Quick, undefined, { id: 'q-1' });
     await node.worker.drain();
     expect(await node.client.getStatus('q-1')).toMatchObject({ status: 'completed', output: 'fast' });
+  });
+
+  // Node runs a timer longer than 2^31 - 1 ms (about 24.8 days) after 1 ms instead.
+  it.each<WorkflowStepOptions<unknown>>([{ timeout: '30d' }, { heartbeatTimeout: '30d' }])('lets a step complete under %o, longer than a timer can wait', async (options) => {
+    @Workflow('month-long')
+    class MonthLong {
+      async run(ctx: WorkflowContext) {
+        return ctx.step('call', () => new Promise((resolve) => setTimeout(() => resolve('done'), 20)), options);
+      }
+    }
+
+    const node = await start([MonthLong]);
+    await node.client.start(MonthLong, undefined, { id: 'm-1' });
+    await node.worker.drain();
+    expect(await node.client.getStatus('m-1')).toMatchObject({ status: 'completed', output: 'done' });
+    expect(node.events.filter((e) => e.type === 'step-failed')).toEqual([]);
   });
 });
 
