@@ -17,6 +17,20 @@ jobs:
       - run: npm run build
       - run: npm run lint
 
+  type-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm install
+      # tests/postgres and tests/mysql import the generated Prisma clients.
+      - run: npm run generate:prisma
+      # lib and tests: the build only type-checks lib, and a test that doesn't compile otherwise shows up as e2e failures.
+      - run: npm run typecheck
+
   e2e:
     runs-on: ubuntu-latest
     strategy:
