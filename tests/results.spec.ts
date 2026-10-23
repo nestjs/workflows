@@ -112,6 +112,33 @@ describe('result()', () => {
     expect(await node.client.getStatus('refund-o-4')).toMatchObject({ status: 'suspended' });
   });
 
+  it("doesn't wait for a slow store past its timeout or its signal, a timeout of 0 included", async () => {
+    const node = await start();
+    await node.client.start(Refund, { orderId: 'o-10', amount: 100 }, { id: 'refund-o-10' });
+    const get = node.store.get.bind(node.store);
+    // Each read answers after 600 ms; the ones the waits give up are awaited before the node closes.
+    const reads: Promise<unknown>[] = [];
+    vi.spyOn(node.store, 'get').mockImplementation((...args) => {
+      const read = new Promise((resolve) => setTimeout(resolve, 600)).then(() => get(...args));
+      reads.push(read);
+      return read;
+    });
+
+    const started = performance.now();
+    const [timedOut, peeked, aborted, startedAndTimedOut] = await Promise.all([
+      node.client.result('refund-o-10', { timeout: '80ms' }).catch((e: unknown) => e),
+      node.client.result('refund-o-10', { timeout: 0 }).catch((e: unknown) => e),
+      node.client.result('refund-o-10', { signal: AbortSignal.timeout(80) }).catch((e: unknown) => e),
+      node.client.startAndWait(Refund, { orderId: 'o-11', amount: 1 }, { id: 'refund-o-11' }, { timeout: '80ms' }).catch((e: unknown) => e),
+    ]);
+    expect(timedOut).toBeInstanceOf(WorkflowResultTimeoutError);
+    expect(peeked).toMatchObject({ name: 'WorkflowResultTimeoutError', timeoutMs: 0 });
+    expect(aborted).toMatchObject({ name: 'TimeoutError' });
+    expect(startedAndTimedOut).toBeInstanceOf(WorkflowResultTimeoutError);
+    expect(performance.now() - started).toBeLessThan(400);
+    await Promise.allSettled(reads);
+  });
+
   it('stops waiting when its signal aborts, and rejects for an unknown or deleted instance', async () => {
     const node = await start();
     await expect(node.client.result('missing')).rejects.toThrow(WorkflowNotFoundError);

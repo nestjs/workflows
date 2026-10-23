@@ -75,7 +75,10 @@ export interface SignalWorkflowOptions {
 export interface WorkflowResultOptions {
   /**
    * How long to wait. Past it, the call rejects with `WorkflowResultTimeoutError`, and the
-   * instance keeps running. Wall-clock time, not the module's clock. Default: no limit.
+   * instance keeps running. Wall-clock time, not the module's clock. Default: no limit. A hard
+   * deadline: a store read still in flight when it passes isn't awaited, so a timeout shorter than
+   * one round trip to the store (0 included) rejects, also for an instance that has ended. To
+   * check an instance without waiting, use `getStatus()`.
    */
   timeout?: Duration;
   /** Stops waiting once aborted (a client that went away), rejecting with the signal's reason. */

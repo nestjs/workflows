@@ -27,7 +27,8 @@ export type ResultOutcome<T> = { value: T } | { error: unknown };
 export interface ResultWaiterOptions<T> {
   /**
    * Reads the outcome from the store: `null` while it hasn't ended. Called when a wait starts, then after a backoff
-   * (25 ms at first, doubling up to a second), until the wait ends; a rejection rejects the wait.
+   * (25 ms at first, doubling up to a second), until the wait ends; a rejection rejects the wait. A wait that times
+   * out, is aborted or closes doesn't wait for a read in flight: its answer or rejection is then ignored.
    */
   read(id: string): Promise<ResultOutcome<T> | null>;
   /** The error a wait rejects with past its `timeout`. Default: an `Error` that names `id`. */
@@ -44,7 +45,10 @@ export interface ResultWaiterOptions<T> {
  * ```
  */
 export interface ResultWaitOptions {
-  /** Stop waiting after this long, in wall-clock time (not a `Clock`'s). Default: no limit. */
+  /**
+   * Stop waiting after this long, in wall-clock time (not a `Clock`'s). Default: no limit. A hard deadline: a read
+   * still in flight when it passes isn't awaited, so a timeout shorter than one read (0 included) rejects.
+   */
   timeout?: Duration;
   /** Stop waiting when it aborts: the wait rejects with its reason. */
   signal?: AbortSignal;
