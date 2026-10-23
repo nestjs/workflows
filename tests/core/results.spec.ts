@@ -101,6 +101,102 @@ describe('ResultWaiter', () => {
     expect(reads).toEqual([]);
   });
 
+  describe('with a read in flight', () => {
+    /** A store whose reads answer `null` after `ms`, or never, counting them. */
+    function slowStore(ms: number | 'never', answer: () => Promise<ResultOutcome<string> | null> = async () => null) {
+      const reads: string[] = [];
+      const waiter = new ResultWaiter<string>({
+        read: (id) => {
+          reads.push(id);
+          return ms === 'never' ? new Promise(() => undefined) : new Promise((resolve) => setTimeout(resolve, ms)).then(answer);
+        },
+        timeoutError: (id, timeoutMs) => new Timeout(id, timeoutMs),
+      });
+      return { waiter, reads };
+    }
+
+    async function timed(wait: Promise<unknown>) {
+      const started = performance.now();
+      const error = await wait.catch((e: unknown) => e);
+      return { error, ms: performance.now() - started };
+    }
+
+    it('gives up the read past its timeout, with the timeout error', async () => {
+      const { waiter } = slowStore('never');
+      const { error, ms } = await timed(waiter.wait('report', { timeout: '50ms' }));
+      expect(error).toBeInstanceOf(Timeout);
+      expect(error).toMatchObject({ id: 'report', timeoutMs: 50 });
+      expect(ms).toBeGreaterThanOrEqual(45);
+      expect(ms).toBeLessThan(400);
+    });
+
+    it("gives up the read when its signal aborts, with the signal's reason", async () => {
+      const { waiter } = slowStore('never');
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new Error('the client went away')), 30);
+      const { error, ms } = await timed(waiter.wait('report', { signal: controller.signal, timeout: '1h' }));
+      expect(error).toEqual(new Error('the client went away'));
+      expect(ms).toBeLessThan(400);
+    });
+
+    it("doesn't read again once its signal aborted during the backoff's sleep", async () => {
+      const { waiter, reads } = slowStore(0);
+      const controller = new AbortController();
+      const result = timed(waiter.wait('report', { signal: controller.signal }));
+      await new Promise((resolve) => setTimeout(resolve, 10)); // the first read answered null: the wait sleeps 25 ms
+      const readsBefore = reads.length;
+      controller.abort(new Error('the client went away'));
+
+      const { error } = await result;
+      expect(error).toEqual(new Error('the client went away'));
+      expect(reads.length).toBe(readsBefore);
+    });
+
+    it('holds to its timeout, also one shorter than a read: 0 rejects on a slow store, even for an outcome stored', async () => {
+      const { waiter, reads } = slowStore(40, async () => ({ value: 'ready' }));
+      for (const timeout of [0, '10ms'] as const) {
+        const { error, ms } = await timed(waiter.wait('report', { timeout }));
+        expect(error).toBeInstanceOf(Timeout);
+        expect(ms).toBeLessThan(35);
+      }
+      expect(reads).toEqual(['report', 'report']);
+
+      // A read that answers before the deadline still counts, 0 included: here, one that answers within the same tick.
+      await expect(storeOf({ report: { value: 'ready' } }).waiter.wait('report', { timeout: 0 })).resolves.toBe('ready');
+    });
+
+    it('still waits for a read with no timeout, and for one with a timeout beyond what timers support', async () => {
+      // A timer longer than 2^31 - 1 ms would run after 1 ms: each read would be given up at once.
+      for (const timeout of [undefined, '30d'] as const) {
+        const { waiter } = slowStore(40, async () => ({ value: 'ready' }));
+        await expect(waiter.wait('report', timeout === undefined ? {} : { timeout })).resolves.toBe('ready');
+      }
+    });
+
+    it('leaves the other waits for the same id reading when one gives up', async () => {
+      const { waiter } = slowStore(80, async () => ({ value: 'ready' }));
+      const short = timed(waiter.wait('report', { timeout: '20ms' }));
+      const long = waiter.wait('report', { timeout: '5s' });
+
+      expect((await short).error).toBeInstanceOf(Timeout);
+      await expect(long).resolves.toBe('ready');
+    });
+
+    it('ignores a read that fails after the wait gave it up', async () => {
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => unhandled.push(reason);
+      process.on('unhandledRejection', onUnhandled);
+      try {
+        const { waiter } = slowStore(40, () => Promise.reject(new Error('connection terminated')));
+        await expect(waiter.wait('report', { timeout: '10ms' })).rejects.toBeInstanceOf(Timeout);
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.off('unhandledRejection', onUnhandled);
+      }
+    });
+  });
+
   it('rejects when the read does', async () => {
     const waiter = new ResultWaiter<string>({ read: async () => Promise.reject(new Error('connection terminated')) });
     await expect(waiter.wait('report')).rejects.toThrow('connection terminated');

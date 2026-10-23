@@ -200,7 +200,8 @@ export class WorkflowClient implements BeforeApplicationShutdown {
 
   /**
    * `start()`, then `result()`: resolves with the output of the instance (the existing one, for
-   * an id that already has one), or rejects as `result()` does. `wait` is `result()`'s options;
+   * an id that already has one), or rejects as `result()` does. `wait` is `result()`'s options,
+   * counted once the instance is stored (`start()` isn't bounded by them);
    * `options.timeout` stays the instance's run timeout. Not with `{ transaction }`: the instance
    * wouldn't exist before your transaction commits.
    */
