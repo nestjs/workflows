@@ -15,6 +15,17 @@ import { cqrsProviders, fulfilmentId, Ledger, OrderFulfilmentWorkflow, OrderPlac
 import type { Database } from './fixtures/database/drizzle.js';
 import { boot, connect, orders, storeKind, tempDb, waitFor, type Node, type TestDb } from './support.js';
 
+/**
+ * The request payload of a CQRS request scope: an `AsyncContext`, or a class that extends it, as the
+ * cqrs docs require. `EventBus` registers it as `REQUEST` itself from @nestjs/cqrs 12.1.1 on; the
+ * tests register it too, for earlier versions.
+ */
+class TenantContext extends AsyncContext {
+  constructor(readonly tenant: string) {
+    super();
+  }
+}
+
 /** What the request-scoped handler saw: the tenant its context carried, and which instance of it ran. */
 class Tenants {
   readonly seen: Array<{ orderId: string; tenant: string | undefined; handler: number }> = [];
@@ -26,8 +37,9 @@ class TenantOrdersHandler implements IEventHandler<OrderPlacedEvent> {
   private readonly handler: number;
 
   constructor(
-    // Undefined for an event published without an AsyncContext (cqrs makes it a new one).
-    @Inject(REQUEST) private readonly request: { tenant: string } | undefined,
+    // For an event published without a TenantContext, cqrs makes a new AsyncContext: no tenant
+    // (and before @nestjs/cqrs 12.1.1, no request at all).
+    @Inject(REQUEST) private readonly request: Partial<TenantContext> | undefined,
     @Inject(Tenants) private readonly tenants: Tenants,
   ) {
     this.handler = ++tenants.handlers;
@@ -125,10 +137,10 @@ describe('sagas, events handlers and async contexts next to the workflows', () =
   it('hands an AsyncContext on to request-scoped handlers, and never takes it for a transaction', async () => {
     const node = await start();
     const starts = watchStarts(node.store);
-    const cats = new AsyncContext();
-    node.moduleRef.registerRequestByContextId({ tenant: 'cats' }, cats.id);
-    const dogs = new AsyncContext();
-    node.moduleRef.registerRequestByContextId({ tenant: 'dogs' }, dogs.id);
+    const cats = new TenantContext('cats');
+    node.moduleRef.registerRequestByContextId(cats, cats.id);
+    const dogs = new TenantContext('dogs');
+    node.moduleRef.registerRequestByContextId(dogs, dogs.id);
 
     await node.eventBus.publish(new OrderPlacedEvent('o-1', 2499), cats);
     await node.eventBus.publishAll([new OrderPlacedEvent('o-2', 1599)], cats);
@@ -148,8 +160,8 @@ describe('sagas, events handlers and async contexts next to the workflows', () =
   it.runIf(storeKind !== 'memory')('reads the transaction from the dispatcher context next to an AsyncContext', async () => {
     const node = await start();
     const starts = watchStarts(node.store);
-    const cats = new AsyncContext();
-    node.moduleRef.registerRequestByContextId({ tenant: 'cats' }, cats.id);
+    const cats = new TenantContext('cats');
+    node.moduleRef.registerRequestByContextId(cats, cats.id);
     const connection = connect(db);
     const database = connection.db as Database;
 
