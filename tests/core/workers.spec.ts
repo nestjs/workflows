@@ -52,7 +52,8 @@ interface HeldRenewal {
 
 /**
  * A `renew` over `queue` whose next call `holdNext()` holds up until it's answered, as a lock its row waits on would
- * hold it; `calls` records each renewal's `until` and how many were in flight with it.
+ * hold it; `calls` records each renewal's `until` and how many were in flight with it. Each renewal takes a turn of the
+ * event loop, as a store's round trip would.
  */
 function heldUp(queue: JobQueue) {
   const calls: Array<{ until: number; inFlight: number }> = [];
@@ -62,6 +63,7 @@ function heldUp(queue: JobQueue) {
     inFlight += 1;
     calls.push({ until, inFlight });
     try {
+      await new Promise((resolve) => setImmediate(resolve));
       if (next) {
         const asked = next;
         next = null;
@@ -230,6 +232,37 @@ describe('LeasedWorker', () => {
     await renewing;
     expect(renewed).toBe(true);
     expect(Math.max(...renewals.calls.map((call) => call.inFlight))).toBe(1);
+
+    finish();
+    await draining;
+  });
+
+  it('sends one renewal after one held up for what asked meanwhile, and no more than was asked for', async () => {
+    const queue = new JobQueue();
+    queue.add('slow');
+    const renewals = heldUp(queue);
+    let run!: LeasedRun;
+    let finish!: () => void;
+    // No heartbeat within the spec: only the item's own calls renew.
+    const worker = workerOn(
+      queue,
+      async (_job, leased) => {
+        run = leased;
+        await new Promise<void>((resolve) => (finish = resolve));
+      },
+      { leaseDuration: '1h', heartbeatInterval: '10m', renew: renewals.renew },
+    );
+
+    const draining = worker.drain();
+    await vi.waitFor(() => expect(run).toBeDefined());
+    const holding = renewals.holdNext();
+    const first = run.renew();
+    const held = await holding;
+    const second = run.renew();
+    held.answer();
+    expect([await first, await second]).toEqual([true, true]);
+    await sleep(50);
+    expect(renewals.calls.length).toBe(held.index + 2);
 
     finish();
     await draining;
