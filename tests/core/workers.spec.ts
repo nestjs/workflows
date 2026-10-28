@@ -43,6 +43,47 @@ class JobQueue {
   }
 }
 
+/** A renewal `heldUp()` holds: its index in `calls`, and how to let it answer. */
+interface HeldRenewal {
+  index: number;
+  /** Answers as the queue would then (no argument), with `held`, or by throwing `error`. */
+  answer(outcome?: boolean | Error): void;
+}
+
+/**
+ * A `renew` over `queue` whose next call `holdNext()` holds up until it's answered, as a lock its row waits on would
+ * hold it; `calls` records each renewal's `until` and how many were in flight with it.
+ */
+function heldUp(queue: JobQueue) {
+  const calls: Array<{ until: number; inFlight: number }> = [];
+  let inFlight = 0;
+  let next: ((held: HeldRenewal) => void) | null = null;
+  const renew = async (job: Job, until: number): Promise<boolean> => {
+    inFlight += 1;
+    calls.push({ until, inFlight });
+    try {
+      if (next) {
+        const asked = next;
+        next = null;
+        const outcome = await new Promise<boolean | Error | undefined>((answer) => asked({ index: calls.length - 1, answer }));
+        if (outcome instanceof Error) {
+          throw outcome;
+        }
+        return outcome ?? (await queue.renew(job, until));
+      }
+      return await queue.renew(job, until);
+    } finally {
+      inFlight -= 1;
+    }
+  };
+  return {
+    renew,
+    calls,
+    /** Holds up the next renewal: resolves once it was asked for. */
+    holdNext: () => new Promise<HeldRenewal>((resolve) => (next = resolve)),
+  };
+}
+
 function workerOn(queue: JobQueue, execute: LeasedWorkerOptions<Job>['execute'], options: Partial<LeasedWorkerOptions<Job>> = {}) {
   return new LeasedWorker<Job>({
     concurrency: 2,
@@ -149,6 +190,123 @@ describe('LeasedWorker', () => {
 
     await worker.drain();
     expect(seen).toEqual([true, true, false, true, true, true, false]);
+  });
+
+  it('renews an item one renewal at a time: what asks while one is held up waits, and one more goes out once it answered', async () => {
+    const clock = new ManualClock(1_000_000);
+    const queue = new JobQueue();
+    queue.add('slow');
+    const renewals = heldUp(queue);
+    let run!: LeasedRun;
+    let finish!: () => void;
+    const worker = workerOn(
+      queue,
+      async (_job, leased) => {
+        run = leased;
+        await new Promise<void>((resolve) => (finish = resolve));
+      },
+      { clock, leaseDuration: '1h', heartbeatInterval: '10ms', renew: renewals.renew },
+    );
+
+    const draining = worker.drain();
+    await vi.waitFor(() => expect(run).toBeDefined());
+    // The next renewal is held up, as a lock would hold it: the clock moves meanwhile.
+    const held = await renewals.holdNext();
+    clock.advance(5_000);
+    // The item's own call and ten heartbeats meanwhile send nothing.
+    let renewed: boolean | undefined;
+    const renewing = run.renew().then((answer) => (renewed = answer));
+    await sleep(100);
+    expect([renewals.calls.length, renewed]).toEqual([held.index + 1, undefined]);
+
+    // Once it answered, one more goes out at once for all of them, its until read then; the call waits for it.
+    const following = renewals.holdNext();
+    held.answer();
+    const follow = await following;
+    await sleep(30);
+    expect([follow.index, renewals.calls.length, renewed]).toEqual([held.index + 1, held.index + 2, undefined]);
+    expect(renewals.calls[follow.index]!.until - renewals.calls[held.index]!.until).toBe(5_000);
+    follow.answer();
+    await renewing;
+    expect(renewed).toBe(true);
+    expect(Math.max(...renewals.calls.map((call) => call.inFlight))).toBe(1);
+
+    finish();
+    await draining;
+  });
+
+  it('sends no renewal after one held up once the lease was lost, marked lost, the run ended or was detached', async () => {
+    for (const ending of ['lost', 'marked lost', 'ended', 'detached'] as const) {
+      const queue = new JobQueue();
+      queue.add('slow');
+      const renewals = heldUp(queue);
+      let run!: LeasedRun;
+      let finish!: () => void;
+      const worker = workerOn(
+        queue,
+        async (_job, leased) => {
+          run = leased;
+          // Its signal ignored.
+          await new Promise<void>((resolve) => (finish = resolve));
+        },
+        { heartbeatInterval: '10ms', shutdownTimeout: '20ms', renew: renewals.renew },
+      );
+
+      const draining = worker.drain();
+      await vi.waitFor(() => expect(run).toBeDefined());
+      const held = await renewals.holdNext();
+      // The item's own call, and heartbeats, ask for another meanwhile.
+      const renewing = run.renew();
+      await sleep(30);
+      if (ending === 'lost') {
+        held.answer(false);
+      } else {
+        if (ending === 'marked lost') {
+          run.loseLease();
+        } else if (ending === 'ended') {
+          finish();
+          await draining;
+        } else {
+          await worker.shutdown();
+        }
+        held.answer(true);
+      }
+      await sleep(30);
+      expect([ending, renewals.calls.length, await renewing]).toEqual([ending, held.index + 1, ending === 'ended' || ending === 'detached']);
+      finish();
+      await draining;
+    }
+  });
+
+  it('renews again after a renewal held up fails: the one asked for meanwhile goes out, and the lease is kept', async () => {
+    const queue = new JobQueue();
+    queue.add('slow');
+    const renewals = heldUp(queue);
+    let run!: LeasedRun;
+    let finish!: () => void;
+    const worker = workerOn(
+      queue,
+      async (_job, leased) => {
+        run = leased;
+        await new Promise<void>((resolve) => (finish = resolve));
+      },
+      { heartbeatInterval: '10ms', renew: renewals.renew },
+    );
+
+    const draining = worker.drain();
+    await vi.waitFor(() => expect(run).toBeDefined());
+    const held = await renewals.holdNext();
+    const renewing = run.renew();
+    const following = renewals.holdNext();
+    // The store dropped the connection: a failure, which says nothing of the lease.
+    held.answer(new Error('connection reset'));
+    const follow = await following;
+    expect(follow.index).toBe(held.index + 1);
+    follow.answer();
+    expect(await renewing).toBe(true);
+    expect(run.leaseLost).toBe(false);
+    finish();
+    await draining;
   });
 
   it('polls, claims what a kick() or a finished item made due at once, and never runs more than its concurrency', async () => {
