@@ -14,6 +14,7 @@ import pg from 'pg';
 import type { SqlExecutor as AnySqlExecutor } from '@nestjs/store-kit';
 import { fromDrizzle, fromPg, PostgresWorkflowStore, WorkflowSchemaError, type SqlExecutor, type SqlTransaction } from '../../lib/postgres/index.js';
 import { workflowStoreSchema } from '../../lib/postgres/migrations/index.js';
+import { endPool } from '../support/postgres.js';
 import { testDatabase } from './support.js';
 
 const { database, reason } = await testDatabase('pgstore_migrations');
@@ -27,8 +28,9 @@ const onPostgres = () =>
     }
   });
 
+// Before the database is dropped (testDatabase's afterAll, which runs after this one), with every connection closed.
 afterAll(async () => {
-  await Promise.all(pools.map((pool) => pool.end()));
+  await Promise.all(pools.map((pool) => endPool(pool)));
 });
 
 /** A pool of its own, as each process has. */

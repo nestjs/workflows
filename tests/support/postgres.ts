@@ -291,9 +291,10 @@ function isAlive(pid: number): boolean {
 /**
  * Ends `pool`, and resolves once its connections are closed. `pool.end()` resolves once it has told each connection to
  * close, not once they have: a test database dropped right after (`WITH (FORCE)`) terminates a connection still
- * closing, and the pool, which nothing listens to any more, throws that as an uncaught error.
+ * closing, and the pool, which nothing listens to any more, throws that as an uncaught error. `end` ends a pool a
+ * library holds instead, as Kysely's `db.destroy()` ends the one it was given.
  */
-export async function endPool(pool: import('pg').Pool): Promise<void> {
+export async function endPool(pool: import('pg').Pool, end: () => Promise<unknown> = () => pool.end()): Promise<void> {
   let open = pool.totalCount;
   const closed = new Promise<void>((resolve) => {
     if (open === 0) {
@@ -306,7 +307,7 @@ export async function endPool(pool: import('pg').Pool): Promise<void> {
       }
     });
   });
-  await pool.end();
+  await end();
   await closed;
 }
 

@@ -147,7 +147,8 @@ export const prismaClient: ClientFactory = {
 export const kyselyClient: ClientFactory = {
   name: 'fromKysely',
   async open(url) {
-    const db = new Kysely<KyselyDatabase>({ dialect: new PostgresDialect({ pool: new pg.Pool({ connectionString: url, max: 10 }) }) });
+    const pool = new pg.Pool({ connectionString: url, max: 10 });
+    const db = new Kysely<KyselyDatabase>({ dialect: new PostgresDialect({ pool }) });
     return {
       name: this.name,
       executor: fromKysely(db),
@@ -156,7 +157,8 @@ export const kyselyClient: ClientFactory = {
       insertOrder: async (tx, id) => {
         await (tx as typeof db).insertInto('orders').values({ id, status: 'placed' }).execute();
       },
-      close: () => db.destroy(),
+      // db.destroy() ends the pool, which listens for no error: wait for its connections to close.
+      close: () => endPool(pool, () => db.destroy()),
     };
   },
 };
