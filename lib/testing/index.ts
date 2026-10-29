@@ -532,11 +532,11 @@ export function workflowStoreContract(
   add('write() with a signal records it as signal() does, only when the write lands', async (t) => {
     await t.create('parent', 0);
     await t.create('child', 1);
-    await t.claim(1, { token: 'p', limit: 1 });
+    equal((await t.claim(1, { token: 'p', limit: 1 })).instances.map((i) => i.id), ['parent'], 'the parent, claimed');
     const parked = { wakeAt: FAR, waits: [{ signal: 'child.ended', key: 'child' }], signalCursor: 0 };
-    await t.store.write('parent', 'p', { now: 2, entries: [], status: 'suspended', release: parked });
-    await t.claim(3, { token: 'stale', leaseUntil: 4 });
-    await t.claim(5, { token: 'c' });
+    equal(await t.store.write('parent', 'p', { now: 2, entries: [], status: 'suspended', release: parked }), true, 'the parent, parked');
+    equal((await t.claim(3, { token: 'stale', leaseUntil: 4 })).instances.map((i) => i.id), ['child'], 'the child, claimed under a lease that ends at 4');
+    equal((await t.claim(5, { token: 'c' })).instances.map((i) => i.id), ['child'], 'the child, claimed again once that lease ended');
     const ended = { name: 'child.ended', key: 'child', dedupeId: 'child', payload: { status: 'completed', output: { label: 'LBL-1' } }, now: 6 };
     const finish = (token: string, now: number) =>
       t.store.write('child', token, { now, entries: [], status: 'completed', output: 1, error: null, release: { wakeAt: null, waits: [], signalCursor: 0 }, signal: { ...ended, now } });
