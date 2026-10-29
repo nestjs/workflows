@@ -44,8 +44,9 @@ export interface LeasedRun {
    * Renews the lease now, as the heartbeat does (a long step that proves it's alive): `false` once it's lost. A renewal
    * that fails (the store is unreachable) keeps the lease, which the next heartbeat renews before it runs out. One
    * renewal is in flight at a time: called while one is (a heartbeat's held up by the store), it waits for that one, then
-   * for one more that goes out as soon as it answered, and resolves with that one's answer; none goes if the lease was
-   * lost, the run ended or was detached meanwhile, and it resolves as it would have then.
+   * for one more that goes out as soon as it answered, or beside it once it went a heartbeat interval unanswered, and
+   * resolves with that one's answer. None goes once the lease was lost, the run ended or was detached, before the call
+   * or meanwhile: it then resolves `false` if the lease was lost, else `true`.
    */
   renew(): Promise<boolean>;
   /** Marks the lease lost, when a fenced write found it gone: aborts `signal` and stops renewing. */

@@ -12,6 +12,8 @@ interface Job {
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/** A turn of the event loop: what the promises settled before it set off is done. */
+const turn = () => new Promise((resolve) => setImmediate(resolve));
 
 /** A queue of due jobs, leased under the tokens its claims hand out; what the worker did to it is recorded. */
 class JobQueue {
@@ -201,36 +203,40 @@ describe('LeasedWorker', () => {
     const renewals = heldUp(queue);
     let run!: LeasedRun;
     let finish!: () => void;
+    // No heartbeat within the spec: the item's own calls renew, and none goes a heartbeat interval unanswered.
     const worker = workerOn(
       queue,
       async (_job, leased) => {
         run = leased;
         await new Promise<void>((resolve) => (finish = resolve));
       },
-      { clock, leaseDuration: '1h', heartbeatInterval: '10ms', renew: renewals.renew },
+      { clock, leaseDuration: '1h', heartbeatInterval: '10m', renew: renewals.renew },
     );
 
     const draining = worker.drain();
     await vi.waitFor(() => expect(run).toBeDefined());
-    // The next renewal is held up, as a lock would hold it: the clock moves meanwhile.
-    const held = await renewals.holdNext();
+    // The item's call is held up, as a lock would hold it: the clock moves meanwhile.
+    const holding = renewals.holdNext();
+    const first = run.renew();
+    const held = await holding;
     clock.advance(5_000);
-    // The item's own call and ten heartbeats meanwhile send nothing.
-    let renewed: boolean | undefined;
-    const renewing = run.renew().then((answer) => (renewed = answer));
-    await sleep(100);
+    // Its calls meanwhile send nothing.
+    let renewed: boolean[] | undefined;
+    const renewing = Promise.all([run.renew(), run.renew(), run.renew()]).then((answers) => (renewed = answers));
+    await sleep(50);
     expect([renewals.calls.length, renewed]).toEqual([held.index + 1, undefined]);
 
-    // Once it answered, one more goes out at once for all of them, its until read then; the call waits for it.
+    // Once it answered, one more goes out at once for all of them, its until read then; they wait for it.
     const following = renewals.holdNext();
     held.answer();
+    expect(await first).toBe(true);
     const follow = await following;
     await sleep(30);
     expect([follow.index, renewals.calls.length, renewed]).toEqual([held.index + 1, held.index + 2, undefined]);
     expect(renewals.calls[follow.index]!.until - renewals.calls[held.index]!.until).toBe(5_000);
     follow.answer();
     await renewing;
-    expect(renewed).toBe(true);
+    expect(renewed).toEqual([true, true, true]);
     expect(Math.max(...renewals.calls.map((call) => call.inFlight))).toBe(1);
 
     finish();
@@ -268,7 +274,7 @@ describe('LeasedWorker', () => {
     await draining;
   });
 
-  it('sends no renewal after one held up once the lease was lost, marked lost, the run ended or was detached', async () => {
+  it('sends no renewal after one held up once the lease was lost, marked lost, the run ended or was detached, nor later', async () => {
     for (const ending of ['lost', 'marked lost', 'ended', 'detached'] as const) {
       const queue = new JobQueue();
       queue.add('slow');
@@ -282,15 +288,16 @@ describe('LeasedWorker', () => {
           // Its signal ignored.
           await new Promise<void>((resolve) => (finish = resolve));
         },
-        { heartbeatInterval: '10ms', shutdownTimeout: '20ms', renew: renewals.renew },
+        { leaseDuration: '1h', heartbeatInterval: '10m', shutdownTimeout: '20ms', renew: renewals.renew },
       );
 
       const draining = worker.drain();
       await vi.waitFor(() => expect(run).toBeDefined());
-      const held = await renewals.holdNext();
-      // The item's own call, and heartbeats, ask for another meanwhile.
+      const holding = renewals.holdNext();
+      void run.renew();
+      const held = await holding;
+      // Another call asks for one more meanwhile.
       const renewing = run.renew();
-      await sleep(30);
       if (ending === 'lost') {
         held.answer(false);
       } else {
@@ -304,8 +311,11 @@ describe('LeasedWorker', () => {
         }
         held.answer(true);
       }
+      const kept = ending === 'ended' || ending === 'detached';
       await sleep(30);
-      expect([ending, renewals.calls.length, await renewing]).toEqual([ending, held.index + 1, ending === 'ended' || ending === 'detached']);
+      expect([ending, renewals.calls.length, await renewing]).toEqual([ending, held.index + 1, kept]);
+      // A call after that sends nothing either, and says what the one asked for meanwhile said.
+      expect([ending, await run.renew(), renewals.calls.length]).toEqual([ending, kept, held.index + 1]);
       finish();
       await draining;
     }
@@ -323,21 +333,167 @@ describe('LeasedWorker', () => {
         run = leased;
         await new Promise<void>((resolve) => (finish = resolve));
       },
-      { heartbeatInterval: '10ms', renew: renewals.renew },
+      { leaseDuration: '1h', heartbeatInterval: '10m', renew: renewals.renew },
     );
 
     const draining = worker.drain();
     await vi.waitFor(() => expect(run).toBeDefined());
-    const held = await renewals.holdNext();
+    const holding = renewals.holdNext();
+    const first = run.renew();
+    const held = await holding;
     const renewing = run.renew();
     const following = renewals.holdNext();
     // The store dropped the connection: a failure, which says nothing of the lease.
     held.answer(new Error('connection reset'));
+    expect(await first).toBe(true);
     const follow = await following;
     expect(follow.index).toBe(held.index + 1);
     follow.answer();
     expect(await renewing).toBe(true);
     expect(run.leaseLost).toBe(false);
+    finish();
+    await draining;
+  });
+
+  it('sends one more beside a renewal a heartbeat interval unanswered, and no third while both are held up', async () => {
+    const queue = new JobQueue();
+    queue.add('slow');
+    const renewals = heldUp(queue);
+    let run!: LeasedRun;
+    let finish!: () => void;
+    const worker = workerOn(
+      queue,
+      async (_job, leased) => {
+        run = leased;
+        await new Promise<void>((resolve) => (finish = resolve));
+      },
+      { leaseDuration: '1h', heartbeatInterval: '20ms', renew: renewals.renew },
+    );
+
+    const draining = worker.drain();
+    await vi.waitFor(() => expect(run).toBeDefined());
+    // A heartbeat's renewal is held up, and so is the one that goes beside it an interval later: a lock both wait on.
+    const first = await renewals.holdNext();
+    const second = await renewals.holdNext();
+    expect(second.index).toBe(first.index + 1);
+    // Five heartbeats and the item's own call meanwhile send nothing.
+    let renewed: boolean | undefined;
+    const renewing = run.renew().then((answer) => (renewed = answer));
+    await sleep(100);
+    expect([renewals.calls.length, renewed]).toEqual([second.index + 1, undefined]);
+
+    // Once one answers, one more goes out for them, beside the other.
+    second.answer();
+    await renewing;
+    expect(renewed).toBe(true);
+    expect(Math.max(...renewals.calls.map((call) => call.inFlight))).toBe(2);
+
+    first.answer();
+    finish();
+    await draining;
+  });
+
+  it('sends what asked meanwhile as soon as the renewal in flight went a heartbeat interval unanswered', async () => {
+    const queue = new JobQueue();
+    queue.add('slow');
+    const renewals = heldUp(queue);
+    let run!: LeasedRun;
+    let finish!: () => void;
+    const worker = workerOn(
+      queue,
+      async (_job, leased) => {
+        run = leased;
+        await new Promise<void>((resolve) => (finish = resolve));
+      },
+      { leaseDuration: '1h', heartbeatInterval: '100ms', renew: renewals.renew },
+    );
+
+    const draining = worker.drain();
+    await vi.waitFor(() => expect(run).toBeDefined());
+    // Right after a heartbeat's renewal answered, the item's own call is held up, and its next call waits for it.
+    await vi.waitFor(() => expect(renewals.calls.length).toBe(1), { interval: 1 });
+    await turn();
+    const holding = renewals.holdNext();
+    void run.renew();
+    const held = await holding;
+    let renewed: boolean | undefined;
+    void run.renew().then((answer) => (renewed = answer));
+    // The next heartbeat finds it in flight for less than an interval, and waits too. One more goes out for both once
+    // it went an interval unanswered, not at the heartbeat after that.
+    await sleep(150);
+    expect([renewals.calls.length, renewed]).toEqual([held.index + 2, true]);
+
+    held.answer();
+    finish();
+    await draining;
+  });
+
+  it('keeps renewing beside a renewal that never answers, as on a connection that died without an error', async () => {
+    const queue = new JobQueue();
+    queue.add('slow');
+    const renewals = heldUp(queue);
+    let run!: LeasedRun;
+    let finish!: () => void;
+    const worker = workerOn(
+      queue,
+      async (_job, leased) => {
+        run = leased;
+        await new Promise<void>((resolve) => (finish = resolve));
+      },
+      { leaseDuration: '1h', heartbeatInterval: '20ms', renew: renewals.renew },
+    );
+
+    const draining = worker.drain();
+    await vi.waitFor(() => expect(run).toBeDefined());
+    const hung = await renewals.holdNext();
+    await sleep(150);
+    // The heartbeat went on beside it, each of its renewals answered: never more than two in flight.
+    expect(renewals.calls.length - hung.index - 1).toBeGreaterThanOrEqual(3);
+    expect(Math.max(...renewals.calls.map((call) => call.inFlight))).toBe(2);
+    expect([run.leaseLost, await run.renew()]).toEqual([false, true]);
+
+    // The dead connection errors at last (a TCP timeout): a failure, which says nothing of the lease.
+    hung.answer(new Error('connection timed out'));
+    finish();
+    await draining;
+    expect(run.leaseLost).toBe(false);
+  });
+
+  it('sends one more once a renewal lands after a later one did, as the store then keeps its older until', async () => {
+    const clock = new ManualClock(1_000_000);
+    const queue = new JobQueue();
+    queue.add('slow');
+    const renewals = heldUp(queue);
+    let run!: LeasedRun;
+    let finish!: () => void;
+    const worker = workerOn(
+      queue,
+      async (_job, leased) => {
+        run = leased;
+        await new Promise<void>((resolve) => (finish = resolve));
+      },
+      { clock, leaseDuration: '1h', heartbeatInterval: '200ms', renew: renewals.renew },
+    );
+
+    const draining = worker.drain();
+    await vi.waitFor(() => expect(run).toBeDefined());
+    // A heartbeat's renewal on a slow connection, and the one that goes beside it an interval later.
+    const slow = await renewals.holdNext();
+    clock.advance(1_000);
+    const later = await renewals.holdNext();
+    // The later one lands first. The next heartbeat is an interval away: nothing else goes meanwhile.
+    later.answer();
+    await turn();
+    expect([renewals.calls.length, queue.leases.get('slow')!.until]).toEqual([later.index + 1, renewals.calls[later.index]!.until]);
+
+    // The slow one lands then, with its older until: one more goes out at once, its until read now.
+    clock.advance(1_000);
+    slow.answer();
+    await turn();
+    expect(renewals.calls.length).toBe(later.index + 2);
+    expect(renewals.calls[later.index + 1]!.until).toBe(clock.now() + 3_600_000);
+    await vi.waitFor(() => expect(queue.leases.get('slow')!.until).toBe(clock.now() + 3_600_000));
+
     finish();
     await draining;
   });

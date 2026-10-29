@@ -12,8 +12,10 @@ import { setRepeatingTimer, setTimer } from '../utils/timer.util.js';
  * free slots), executes them, renews each one's lease every `heartbeatInterval` (a third of the lease by default), and
  * aborts an item's `signal` when a renewal finds its lease gone. An item has one renewal in flight at a time, so a store
  * that holds a renewal up (a lock its row waits on) gets no more of them meanwhile: one asked for in the meantime goes
- * out once that one answered. It looks for work every `pollInterval`, and at once after `kick()` (a local write made
- * something due) or when an item ends. `drain()` runs due items on demand, for tests and scripts.
+ * out once that one answered, or beside it once it went a heartbeat interval unanswered (a connection that died without
+ * an error never answers), and none more while those two are in flight. It looks for work every `pollInterval`, and at
+ * once after `kick()` (a local write made something due) or when an item ends. `drain()` runs due items on demand, for
+ * tests and scripts.
  *
  * Shutdown is graceful: call `shutdown()` from `onModuleDestroy`. It stops claiming, waits for the claims in flight
  * (what they claim starts, told to stop at once), aborts every running item's `signal`, and waits up to
@@ -245,7 +247,7 @@ export class LeasedWorker<T> {
   }
 
   private launch(item: T): Promise<void> {
-    const run: Run<T> = new Run(item, () => this.renew(run));
+    const run: Run<T> = new Run(item, this.heartbeatMs, () => this.renew(run));
     this.runs.add(run);
     if (this.stopped) {
       run.halt();
@@ -281,6 +283,13 @@ export class LeasedWorker<T> {
   }
 }
 
+/** A renewal in flight: its place in the order renewals went out, and whether it went a heartbeat interval unanswered. */
+interface Renewal {
+  seq: number;
+  late: boolean;
+  timer: NodeJS.Timeout;
+}
+
 /** A claimed item's run: its signal, its heartbeat, and what became of its lease. */
 class Run<T> implements LeasedRun {
   heartbeat?: NodeJS.Timeout;
@@ -288,15 +297,20 @@ class Run<T> implements LeasedRun {
   private readonly controller = new AbortController();
   private lost = false;
   private isDetached = false;
-  /** Its `execute` settled: no renewal follows the one in flight. */
+  /** Its `execute` settled: no more renewals. */
   private ended = false;
-  /** The renewal in flight, if one is. */
-  private renewing?: Promise<boolean>;
-  /** The renewal asked for while one was in flight, which goes out once that one answered: its callers' answer. */
+  /** The renewals in flight: one, or two once the older went a heartbeat interval unanswered. */
+  private readonly inFlight = new Set<Renewal>();
+  /** How many renewals went out: the next one's `seq` follows. */
+  private sent = 0;
+  /** The `seq` of the latest renewal that landed (the store wrote its `until`). */
+  private landed = 0;
+  /** The renewal asked for while none could go out, which goes out as soon as one can: its callers' answer. */
   private again?: { promise: Promise<boolean>; resolve(held: boolean): void };
 
   constructor(
     readonly item: T,
+    private readonly heartbeatMs: number,
     private readonly renewer: () => Promise<boolean>,
   ) {}
 
@@ -317,47 +331,77 @@ class Run<T> implements LeasedRun {
    * would otherwise get another at each tick, each holding a connection, and an older one could land after a newer
    * one, shortening the lease. One asked for while another is in flight sends nothing then: it goes out once that one
    * answered, its `until` read then (so after a renewal that was held up, the lease's deadline counts from when it
-   * answered), those asked for meanwhile sharing it, and resolves with its answer. None goes once the lease is lost
-   * (that answer, or `loseLease()`), the run ended, or it was detached: those asked for meanwhile resolve as `renew()`
-   * would then.
+   * answered), those asked for meanwhile sharing it, and resolves with its answer. A renewal a heartbeat interval
+   * unanswered no longer holds the next one back, as it may never answer (a connection that died without an error):
+   * the next goes out beside it, and no third while both are in flight. One that lands after a later one did leaves
+   * its older `until`, so one more follows it. None goes once the lease is lost (an answer, or `loseLease()`), the run
+   * ended, or it was detached: those asked for meanwhile resolve as `renew()` would then.
    */
   renew(): Promise<boolean> {
-    if (this.lost || this.isDetached) {
+    if (this.lost || this.isDetached || this.ended) {
       return Promise.resolve(!this.lost);
     }
-    if (this.renewing) {
-      if (!this.again) {
-        let resolve!: (held: boolean) => void;
-        const promise = new Promise<boolean>((resolved) => (resolve = resolved));
-        this.again = { promise, resolve };
-      }
-      return this.again.promise;
-    }
-    return this.send();
+    return this.canSend() ? this.send() : this.ask();
   }
 
-  /** Sends a renewal, and once it answered, before its callers hear it, the one asked for meanwhile if it still goes. */
-  private send(): Promise<boolean> {
-    const answer = this.renewOnce();
-    this.renewing = answer;
-    void answer.then(() => {
-      this.renewing = undefined;
-      const again = this.again;
+  /** Whether a renewal can go out now: none is in flight, or one went a heartbeat interval unanswered; never a third. */
+  private canSend(): boolean {
+    const [oldest, next] = this.inFlight;
+    return !oldest || (!next && oldest.late);
+  }
+
+  /** Asks for the renewal that goes out as soon as one can (`flush()`): its callers' answer. */
+  private ask(): Promise<boolean> {
+    if (!this.again) {
+      let resolve!: (held: boolean) => void;
+      const promise = new Promise<boolean>((resolved) => (resolve = resolved));
+      this.again = { promise, resolve };
+    }
+    return this.again.promise;
+  }
+
+  /**
+   * Sends the renewal asked for meanwhile if one can go out now (a renewal answered, or went a heartbeat interval
+   * unanswered). None goes once the lease is lost, the run ended or was detached: its callers hear what `renew()` would
+   * say then.
+   */
+  private flush(): void {
+    const again = this.again;
+    if (!again) {
+      return;
+    }
+    if (this.lost || this.isDetached || this.ended) {
       this.again = undefined;
-      if (!again) {
-        return;
-      }
-      if (this.lost || this.isDetached || this.ended) {
-        again.resolve(!this.lost);
-        return;
-      }
+      again.resolve(!this.lost);
+    } else if (this.canSend()) {
+      this.again = undefined;
       void this.send().then(again.resolve);
+    }
+  }
+
+  /** Sends a renewal, and once it answered, before its callers hear it, the one asked for meanwhile if it can go. */
+  private send(): Promise<boolean> {
+    const renewal: Renewal = {
+      seq: ++this.sent,
+      late: false,
+      // Unanswered for a heartbeat interval, it no longer holds the next one back.
+      timer: setTimer(() => {
+        renewal.late = true;
+        this.flush();
+      }, this.heartbeatMs).unref(),
+    };
+    this.inFlight.add(renewal);
+    const answer = this.renewOnce(renewal.seq);
+    void answer.then(() => {
+      clearTimeout(renewal.timer);
+      this.inFlight.delete(renewal);
+      this.flush();
     });
     return answer;
   }
 
   /** One renewal: `false` once it found the lease gone; one that fails keeps the lease. */
-  private async renewOnce(): Promise<boolean> {
+  private async renewOnce(seq: number): Promise<boolean> {
     let held: boolean;
     try {
       held = await this.renewer();
@@ -367,8 +411,14 @@ class Run<T> implements LeasedRun {
     }
     if (!held) {
       this.loseLease();
+      return false;
     }
-    return held;
+    // It landed after a later renewal did (on a slower connection): the store keeps its older `until` now.
+    if (seq < this.landed) {
+      void this.ask();
+    }
+    this.landed = Math.max(this.landed, seq);
+    return true;
   }
 
   loseLease(): void {
@@ -393,7 +443,7 @@ class Run<T> implements LeasedRun {
     clearInterval(this.heartbeat);
   }
 
-  /** Its `execute` settled: no more heartbeats, and no renewal follows the one in flight. */
+  /** Its `execute` settled: no more heartbeats, and no more renewals. */
   end(): void {
     this.ended = true;
     clearInterval(this.heartbeat);
