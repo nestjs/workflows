@@ -1,6 +1,6 @@
 {
   "name": "@nestjs/workflows",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "Durable workflows for NestJS: long-running processes written as plain async code that survive restarts, with no workflow server to run.",
   "keywords": [
     "nestjs",
