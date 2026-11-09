@@ -3,7 +3,8 @@
  * UTC and across daylight saving changes. Expected instants are ISO strings with explicit offsets. The 2026 changes:
  * Europe/Warsaw skips 02:00-03:00 on 29 March and repeats 02:00-03:00 on 25 October (both at 01:00 UTC);
  * America/New_York skips 02:00-03:00 on 8 March and repeats 01:00-02:00 on 1 November; Australia/Lord_Howe repeats
- * 01:30-02:00 on 5 April and skips 02:00-02:30 on 4 October.
+ * 01:30-02:00 on 5 April and skips 02:00-02:30 on 4 October; Pacific/Auckland repeats 02:00-03:00 on 5 April and
+ * skips 02:00-03:00 on 27 September.
  */
 import { cronOccurrences, nextCron, parseCron, type CronExpression } from '../../lib/core/scheduling/cron.util.js';
 
@@ -11,6 +12,7 @@ const MINUTE = 60_000;
 const WARSAW = 'Europe/Warsaw';
 const NEW_YORK = 'America/New_York';
 const LORD_HOWE = 'Australia/Lord_Howe';
+const AUCKLAND = 'Pacific/Auckland';
 
 const at = (iso: string) => Date.parse(iso);
 const iso = (instant: number) => new Date(instant).toISOString();
@@ -346,6 +348,17 @@ describe('daylight saving time', () => {
       expect(nextCron(parseCron('30 2 * * *'), at('2026-03-08T03:10:00-04:00'), NEW_YORK)).toBe(at('2026-03-08T03:30:00-04:00'));
       expect(nextCron(parseCron('30 1 * * *'), at('2026-11-01T01:15:00-05:00'), NEW_YORK)).toBe(at('2026-11-02T01:30:00-05:00'));
       expect(between('30 2 * * *', '2026-01-01T05:00:00Z', '2027-01-01T05:00:00Z', NEW_YORK)).toHaveLength(365);
+    });
+  });
+
+  describe('in Pacific/Auckland, more than 12 hours ahead of UTC', () => {
+    it('runs a daily 02:30 that clocks skip at 03:30 NZDT, and a repeated one once, the first time', () => {
+      expect(occurrences('30 2 * * *', '2026-09-25T00:00:00Z', 3, AUCKLAND)).toEqual(
+        utc('2026-09-26T02:30:00+12:00', '2026-09-27T03:30:00+13:00', '2026-09-28T02:30:00+13:00'),
+      );
+      expect(occurrences('30 2 * * *', '2026-04-03T00:00:00Z', 3, AUCKLAND)).toEqual(
+        utc('2026-04-04T02:30:00+13:00', '2026-04-05T02:30:00+13:00', '2026-04-06T02:30:00+12:00'),
+      );
     });
   });
 

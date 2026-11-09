@@ -1,4 +1,3 @@
-const HOUR = 3_600_000;
 const DAY = 86_400_000;
 
 const formats = new Map<string, Intl.DateTimeFormat>();
@@ -27,10 +26,11 @@ export function toWallTime(utc: number, tz: string): number {
  * lands that much later (02:30 on the day Europe/Warsaw skips 02:00-03:00 is 03:30 CEST) — RFC 5545's rule.
  */
 export function fromWallTime(wall: number, tz: string): number {
-  // A zone's changes are months apart, so the offsets half a day either side of `wall` are the ones in force
-  // before and after any change near it.
-  const before = wall - offsetAt(wall - 12 * HOUR, tz);
-  const after = wall - offsetAt(wall + 12 * HOUR, tz);
+  // A zone's changes are months apart, so the offsets a day either side of `wall` are the ones in force before and
+  // after any change near it. Half a day isn't enough: read as an instant, `wall` is the zone's offset (up to 14
+  // hours) away from its own, so 12 hours before it can already be past a change in Pacific/Auckland (+13).
+  const before = wall - offsetAt(wall - DAY, tz);
+  const after = wall - offsetAt(wall + DAY, tz);
   const first = Math.min(before, after);
   if (toWallTime(first, tz) === wall) {
     return first;

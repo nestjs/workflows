@@ -3,7 +3,9 @@
  * offsets, so they don't lean on the code under test. The 2026 changes used below: Europe/Warsaw skips 02:00-03:00 on
  * 29 March and repeats 02:00-03:00 on 25 October (both at 01:00 UTC); America/New_York skips 02:00-03:00 on 8 March
  * and repeats 01:00-02:00 on 1 November; Australia/Lord_Howe moves by 30 minutes, repeating 01:30-02:00 on 5 April
- * and skipping 02:00-02:30 on 4 October.
+ * and skipping 02:00-02:30 on 4 October. Pacific/Auckland (+12/+13) repeats 02:00-03:00 on 5 April and skips 02:00-03:00
+ * on 27 September, and Pacific/Chatham (+12:45/+13:45) repeats and skips 02:45-03:45 on the same days (all at 14:00 UTC
+ * the day before).
  */
 import { assertTimeZone, fromWallTime, offsetAt, recentClockChange, toWallTime } from '../../lib/core/scheduling/time-zone.util.js';
 
@@ -12,6 +14,8 @@ const HOUR = 3_600_000;
 const WARSAW = 'Europe/Warsaw';
 const NEW_YORK = 'America/New_York';
 const LORD_HOWE = 'Australia/Lord_Howe';
+const AUCKLAND = 'Pacific/Auckland';
+const CHATHAM = 'Pacific/Chatham';
 
 /** An instant, from an ISO string with an offset. */
 const at = (iso: string) => Date.parse(iso);
@@ -114,6 +118,14 @@ describe('fromWallTime()', () => {
     expect(fromWallTime(wall('2026-04-05T01:45:00'), LORD_HOWE)).toBe(at('2026-04-05T01:45:00+11:00'));
   });
 
+  it('maps wall times near a change in zones more than 12 hours ahead of UTC', () => {
+    expect(fromWallTime(wall('2026-09-27T02:30:00'), AUCKLAND)).toBe(at('2026-09-27T03:30:00+13:00'));
+    expect(fromWallTime(wall('2026-04-05T02:30:00'), AUCKLAND)).toBe(at('2026-04-05T02:30:00+13:00'));
+    expect(fromWallTime(wall('2026-09-27T03:00:00'), CHATHAM)).toBe(at('2026-09-27T04:00:00+13:45'));
+    expect(fromWallTime(wall('2026-04-05T02:30:00'), CHATHAM)).toBe(at('2026-04-05T02:30:00+13:45'));
+    expect(fromWallTime(wall('2026-04-05T03:00:00'), CHATHAM)).toBe(at('2026-04-05T03:00:00+13:45'));
+  });
+
   it('works in UTC and fixed zones, and before the year 100', () => {
     expect(fromWallTime(wall('2026-03-29T02:30:00'), 'UTC')).toBe(at('2026-03-29T02:30:00Z'));
     expect(fromWallTime(wall('2026-03-29T02:30:00'), 'Asia/Kolkata')).toBe(at('2026-03-29T02:30:00+05:30'));
@@ -127,6 +139,8 @@ describe('fromWallTime()', () => {
     [WARSAW, ['2026-03-29T02:00:00', '2026-03-29T03:00:00', HOUR], ['2026-10-25T01:00:00Z', '2026-10-25T02:00:00Z', HOUR]],
     [NEW_YORK, ['2026-03-08T02:00:00', '2026-03-08T03:00:00', HOUR], ['2026-11-01T06:00:00Z', '2026-11-01T07:00:00Z', HOUR]],
     [LORD_HOWE, ['2026-10-04T02:00:00', '2026-10-04T02:30:00', 30 * MINUTE], ['2026-04-04T15:00:00Z', '2026-04-04T15:30:00Z', 30 * MINUTE]],
+    [AUCKLAND, ['2026-09-27T02:00:00', '2026-09-27T03:00:00', HOUR], ['2026-04-04T14:00:00Z', '2026-04-04T15:00:00Z', HOUR]],
+    [CHATHAM, ['2026-09-27T02:45:00', '2026-09-27T03:45:00', HOUR], ['2026-04-04T14:00:00Z', '2026-04-04T15:00:00Z', HOUR]],
   ] as const)('round-trips wall times and instants through 2026 in %s', (tz, [gapStart, gapEnd, gap], [repeatStart, repeatEnd, repeat]) => {
     for (let instant = at('2026-01-01T00:00:00Z'); instant < at('2027-01-01T00:00:00Z'); instant += 53 * MINUTE) {
       const inSecondPass = instant >= at(repeatStart) && instant < at(repeatEnd);
