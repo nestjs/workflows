@@ -69,6 +69,11 @@ describe('nextOccurrences()', () => {
     expect(nextOccurrences(limited, { from: T0, runs: 2 })).toEqual([hours(1)]);
     expect(nextOccurrences(limited, { from: T0, runs: 3 })).toEqual([]);
     expect(nextOccurrences(parseSchedule({ every: '1h', endAt: hours(2) }), { from: T0 })).toEqual([hours(1), hours(2)]);
+    expect(nextOccurrences(parseSchedule({ every: '1h' }), { from: -7_200_000, count: 3 })).toEqual([
+      -3_600_000,
+      0,
+      3_600_000,
+    ]);
   });
 
   it('refuses a count or a from it can not use, naming its owner', () => {

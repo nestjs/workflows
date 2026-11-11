@@ -218,7 +218,7 @@ export function latestOccurrences(spec: ScheduleSpec, from: number, to: number, 
 }
 
 function* everyOccurrences(every: number, anchor: number, after: number): Generator<number> {
-  let at = after < anchor ? anchor : anchor + (Math.floor((after - anchor) / every) + 1) * every;
+  let at = anchor + (Math.floor((after - anchor) / every) + 1) * every;
   for (;;) {
     yield at;
     at += every;
