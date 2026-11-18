@@ -152,6 +152,83 @@ describe('crash recovery', () => {
     expect(world.calls.filter((c) => c.op === 'two').map((c) => c.attempt)).toEqual([1, 1]);
   });
 
+  it.each(['successful journal read', 'failed journal read', 'hand-back read'] as const)(
+    'leaves the lease to expire when a %s settles after shutdown',
+    async (readHeld) => {
+      const run = vi.fn();
+      @Workflow('late-journal')
+      class LateJournal {
+        async run() {
+          run();
+        }
+      }
+
+      const node = await start([LateJournal]);
+      await node.client.start(LateJournal, undefined, { id: 'late-journal' });
+      const claimed = deferred();
+      const releaseClaim = deferred();
+      const releaseRead = deferred();
+      const claim = node.store.claim.bind(node.store);
+      const heldClaim = vi.spyOn(node.store, 'claim').mockImplementationOnce(async (request) => {
+        const result = await claim(request);
+        claimed.resolve();
+        await releaseClaim.promise;
+        return result;
+      });
+      const write = vi.spyOn(node.store, 'write').mockResolvedValue(true);
+      const logged = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      const draining = node.worker.drain();
+      const get = vi.spyOn(node.store, 'get');
+      let stopping: Promise<void> | undefined;
+
+      try {
+        await claimed.promise;
+        const details = await node.store.get('late-journal', { journal: true });
+        expect(details?.leaseUntil).toBe(clock.now() + 30_000);
+        get.mockClear();
+        get.mockImplementation(async (_id, options) => {
+          if (!options?.journal || readHeld !== 'hand-back read') {
+            await releaseRead.promise;
+          }
+          if (options?.journal && readHeld !== 'successful journal read') {
+            throw new Error('Cannot read the journal');
+          }
+          return details;
+        });
+
+        vi.useFakeTimers();
+        const stopped = vi.fn();
+        stopping = node.worker.shutdown().then(stopped);
+        await vi.advanceTimersByTimeAsync(40);
+        releaseClaim.resolve();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(get).toHaveBeenNthCalledWith(1, 'late-journal', { journal: true });
+        const readsBeforeDeadline = readHeld === 'hand-back read' ? 2 : 1;
+        expect(get).toHaveBeenCalledTimes(readsBeforeDeadline);
+        expect(stopped).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(10);
+        expect(stopped).toHaveBeenCalledOnce();
+        releaseRead.resolve();
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(run).not.toHaveBeenCalled();
+        expect(node.events.map((event) => event.type)).not.toContain('workflow-started');
+        expect(get).toHaveBeenCalledTimes(readsBeforeDeadline);
+        expect(write).not.toHaveBeenCalled();
+      } finally {
+        releaseClaim.resolve();
+        releaseRead.resolve();
+        vi.useRealTimers();
+        await Promise.allSettled([draining, stopping]);
+        heldClaim.mockRestore();
+        get.mockRestore();
+        write.mockRestore();
+        logged.mockRestore();
+      }
+    },
+  );
+
   it("applies an execution's journal writes in the order it issued them, however slow the store answers one", async () => {
     @Workflow('checkpointed')
     class Checkpointed {

@@ -67,8 +67,11 @@ export interface LeasedRun {
  * ```
  */
 export interface LeasedWorkerOptions<T> {
-  /** Leases up to `limit` due items under `lease`; `[]` when none is due. */
-  claim(lease: LeaseRequest, limit: number): Promise<T[]>;
+  /**
+   * Leases up to `limit` due items under `lease` and returns `[]` when none is due. `signal` aborts when shutdown
+   * stops waiting for the claim. The store call may still settle, so skip follow-up store work once the signal aborts.
+   */
+  claim(lease: LeaseRequest, limit: number, signal?: AbortSignal): Promise<T[]>;
   /** Extends the lease of `item` to `until`; `false` when it is gone (its token isn't the item's any more). */
   renew(item: T, until: number): Promise<boolean>;
   /** Runs one claimed item. It may find `run.signal` already aborted (claimed as the worker shut down): hand it back. */
@@ -90,7 +93,10 @@ export interface LeasedWorkerOptions<T> {
   leaseDuration?: Duration;
   /** How often a running item's lease is renewed. Default a third of `leaseDuration`. */
   heartbeatInterval?: Duration;
-  /** How long `shutdown()` waits for running items before detaching them. Default `'10s'`. */
+  /**
+   * Shared time for in-flight claims and executions at shutdown. Late claims and detached runs keep their leases
+   * until expiry. Default `'10s'`.
+   */
   shutdownTimeout?: Duration;
   /** The least time between two `produce()` calls of the polling loop (wall-clock). Default 0: every poll. */
   produceInterval?: Duration;

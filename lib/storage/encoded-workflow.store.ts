@@ -131,20 +131,41 @@ export class EncodedWorkflowStore implements WorkflowInstanceStore {
     return this.inner.purge(query);
   }
 
-  async claim(request: WorkflowClaimRequest): Promise<WorkflowClaim> {
+  async claim(request: WorkflowClaimRequest, signal?: AbortSignal): Promise<WorkflowClaim> {
     const claim = await this.inner.claim(request);
-    const instances = await this.readable(claim.instances, (instance) => this.decodeInstance(instance), 'Instance', (instance) =>
-      this.handBack(instance.id, request.token, { now: request.now, leaseUntil: request.leaseUntil, signalCursor: claim.lastSignalId }),
-    );
+    const instances: WorkflowClaim['instances'] = [];
+    for (const instance of claim.instances) {
+      if (signal?.aborted) {
+        break;
+      }
+      try {
+        instances.push(await this.decodeInstance(instance));
+      } catch (error) {
+        if (signal?.aborted) {
+          break;
+        }
+        EncodedWorkflowStore.logger.error(`Instance "${instance.id}" can't be read, so it isn't run; it is claimed again later. ${(error as Error).message}`);
+        // At worst its lease expires, as if its worker had died.
+        const lease = { now: request.now, leaseUntil: request.leaseUntil, signalCursor: claim.lastSignalId };
+        await this.handBack(instance.id, request.token, lease, () => signal?.aborted === true).catch(() => undefined);
+      }
+    }
     return { ...claim, instances };
   }
 
   /**
    * Hands a leased instance back untouched, with its waits, due when its lease would have ended: its concurrency slot
    * is free at once, and the instances due before then go first, instead of this one taking the slot at every claim.
+   * Checks `shouldStop` before reading the waits and again before writing the release.
    */
-  async handBack(id: string, token: string, lease: { now: number; leaseUntil: number; signalCursor: number }): Promise<void> {
+  async handBack(id: string, token: string, lease: { now: number; leaseUntil: number; signalCursor: number }, shouldStop?: () => boolean): Promise<void> {
+    if (shouldStop?.()) {
+      return;
+    }
     const waits = (await this.inner.get(id))?.waits ?? [];
+    if (shouldStop?.()) {
+      return;
+    }
     await this.inner.write(id, token, {
       now: lease.now,
       entries: [],
@@ -279,24 +300,6 @@ export class EncodedWorkflowStore implements WorkflowInstanceStore {
   private async instanceOf(stored: Maybe<{ instance: WorkflowInstance; created: boolean }>): Promise<{ instance: WorkflowInstance; created: boolean }> {
     const { instance, created } = await stored;
     return { instance: await this.decodeInstance(instance), created };
-  }
-
-  /**
-   * What a claim leased, decoded. One that can't be (a codec that is gone) is left out, logged, and handed back to
-   * be claimed again later, and read once the codec is back, while the others run.
-   */
-  private async readable<T extends { id: string }>(claimed: T[], decode: (item: T) => Promise<T>, kind: string, handBack: (item: T) => Promise<unknown>): Promise<T[]> {
-    const decoded: T[] = [];
-    for (const item of claimed) {
-      try {
-        decoded.push(await decode(item));
-      } catch (error) {
-        EncodedWorkflowStore.logger.error(`${kind} "${item.id}" can't be read, so it isn't run; it is claimed again later. ${(error as Error).message}`);
-        // At worst its lease expires, as if its worker had died.
-        await handBack(item).catch(() => undefined);
-      }
-    }
-    return decoded;
   }
 }
 

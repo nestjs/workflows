@@ -572,6 +572,106 @@ describe('LeasedWorker', () => {
     expect(await worker.drain()).toBe(0);
   });
 
+  it('finishes shutdown at its timeout with a stalled polling claim', async () => {
+    vi.useFakeTimers();
+    const queue = new JobQueue();
+    queue.add('late');
+    let releaseClaim!: () => void;
+    const held = new Promise<void>((resolve) => (releaseClaim = resolve));
+    const claim = vi.fn(async (lease: LeaseRequest, limit: number) => {
+      await held;
+      return queue.claim(lease, limit);
+    });
+    const execute = vi.fn(async () => undefined);
+    const worker = workerOn(queue, execute, { claim, shutdownTimeout: '40ms' });
+    const stopped = vi.fn();
+    worker.start();
+    const stopping = worker.shutdown().then(stopped);
+
+    try {
+      expect(claim).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(39);
+      expect(stopped).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(stopped).toHaveBeenCalledOnce();
+
+      releaseClaim();
+      await vi.advanceTimersByTimeAsync(30);
+      expect(queue.leases.has('late')).toBe(true);
+      expect(execute).not.toHaveBeenCalled();
+      expect(queue.renewals).toEqual([]);
+      expect(claim).toHaveBeenCalledOnce();
+    } finally {
+      releaseClaim();
+      await stopping;
+      vi.useRealTimers();
+    }
+  });
+
+  it('handles a claim that rejects after shutdown stopped waiting for it', async () => {
+    vi.useFakeTimers();
+    let rejectClaim!: (error: Error) => void;
+    const claim = new Promise<Job[]>((_, reject) => (rejectClaim = reject));
+    const error = new Error('store closed');
+    const drained = vi.fn();
+    const failed = vi.fn();
+    const worker = workerOn(new JobQueue(), async () => undefined, { claim: () => claim, shutdownTimeout: '40ms' });
+    const draining = worker.drain().then(drained, failed);
+    const stopping = worker.shutdown();
+
+    try {
+      await vi.advanceTimersByTimeAsync(40);
+      expect(drained).toHaveBeenCalledWith(0);
+      rejectClaim(error);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(failed).not.toHaveBeenCalled();
+    } finally {
+      rejectClaim(error);
+      await Promise.all([draining, stopping]);
+      vi.useRealTimers();
+    }
+  });
+
+  it('shares the shutdown timeout between a claim and its execution', async () => {
+    vi.useFakeTimers();
+    const queue = new JobQueue();
+    queue.add('slow');
+    let releaseClaim!: () => void;
+    const heldClaim = new Promise<void>((resolve) => (releaseClaim = resolve));
+    let finish!: () => void;
+    const execution = new Promise<void>((resolve) => (finish = resolve));
+    const execute = vi.fn((_job: Job, _run: LeasedRun) => execution);
+    const worker = workerOn(queue, execute, {
+      claim: async (lease, limit) => {
+        await heldClaim;
+        return queue.claim(lease, limit);
+      },
+      shutdownTimeout: '40ms',
+    });
+    const stopped = vi.fn();
+    worker.start();
+    const stopping = worker.shutdown().then(stopped);
+
+    try {
+      await vi.advanceTimersByTimeAsync(30);
+      releaseClaim();
+      await vi.advanceTimersByTimeAsync(9);
+      expect(execute).toHaveBeenCalledOnce();
+      const run = execute.mock.calls[0]![1];
+      expect(run.signal.aborted).toBe(true);
+      expect(run.detached).toBe(false);
+      expect(stopped).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(stopped).toHaveBeenCalledOnce();
+      expect(run.detached).toBe(true);
+    } finally {
+      releaseClaim();
+      finish();
+      await stopping;
+      vi.useRealTimers();
+    }
+  });
+
   it('detaches what outlives the shutdown timeout: no more renewals', async () => {
     const queue = new JobQueue();
     queue.add('stuck');

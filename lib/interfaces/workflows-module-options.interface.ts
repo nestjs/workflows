@@ -21,7 +21,10 @@ export interface WorkflowWorkerOptions {
   leaseDuration?: Duration;
   /** How often a running instance extends its lease. Default a third of `leaseDuration`. */
   heartbeatInterval?: Duration;
-  /** How long shutdown waits for running executions before abandoning them. Default 10s. */
+  /**
+   * Shared time for in-flight claims and executions at shutdown. Late claims and detached executions keep their
+   * leases until expiry. Default 10s.
+   */
   shutdownTimeout?: Duration;
 }
 

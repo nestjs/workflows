@@ -92,7 +92,7 @@ export class WorkflowWorker implements OnApplicationBootstrap, OnModuleDestroy, 
       // Schedules have second precision: their occurrences are started at most once a second, however often it polls.
       produceInterval: '1s',
       produce: async () => this.produced(await this.scheduler.produce(this.id, this.leased.leaseMs)),
-      claim: (lease, limit) => this.claim(lease, limit),
+      claim: (lease, limit, signal) => this.claim(lease, limit, signal),
       renew: (claimed, until) => this.renew(claimed, until),
       execute: (claimed, run) => this.execute(claimed, run),
       onError: (error, stage) => this.logger.error(FAILED[stage], error as Error),
@@ -180,32 +180,34 @@ export class WorkflowWorker implements OnApplicationBootstrap, OnModuleDestroy, 
   }
 
   /**
-   * @internal Called on application shutdown. Stops claiming, asks running
-   * executions to stop (their steps see `signal.aborted`), and waits up to
-   * `shutdownTimeout`. Executions that stopped are handed back at once; the
-   * rest keep their lease until it expires, because their step may still be running.
+   * @internal Called on application shutdown. Stops claiming, asks running executions to stop (their steps see
+   * `signal.aborted`), and gives claims and executions a shared `shutdownTimeout`. Late claims and detached
+   * executions keep their leases until expiry.
    */
   shutdown(): Promise<void> {
     return this.leased.shutdown();
   }
 
   /** Leases due instances of the workflow versions this process runs, under their limits. */
-  private async claim(lease: LeaseRequest, limit: number): Promise<Claimed[]> {
+  private async claim(lease: LeaseRequest, limit: number, signal?: AbortSignal): Promise<Claimed[]> {
     const workflows = this.registry.versions();
     if (workflows.length === 0) {
       return [];
     }
 
-    const { instances, lastSignalId } = await this.store.claim({
-      owner: lease.owner,
-      token: lease.token,
-      now: lease.now,
-      leaseUntil: lease.until,
-      limit,
-      workflows,
-      limits: this.registry.limits(),
-      rateLimits: this.registry.rateLimits(),
-    });
+    const { instances, lastSignalId } = await this.store.claim(
+      {
+        owner: lease.owner,
+        token: lease.token,
+        now: lease.now,
+        leaseUntil: lease.until,
+        limit,
+        workflows,
+        limits: this.registry.limits(),
+        rateLimits: this.registry.rateLimits(),
+      },
+      signal,
+    );
     return instances.map((instance) => ({ instance: { ...instance, leaseToken: lease.token }, signalCursor: lastSignalId }));
   }
 
@@ -225,8 +227,8 @@ export class WorkflowWorker implements OnApplicationBootstrap, OnModuleDestroy, 
     const definition = this.registry.get(instance.workflow, instance.version)!;
 
     try {
-      const details = await this.claimed(instance, signalCursor);
-      if (!details) {
+      const details = await this.claimed(instance, signalCursor, run);
+      if (run.detached || !details) {
         return;
       }
 
@@ -253,21 +255,24 @@ export class WorkflowWorker implements OnApplicationBootstrap, OnModuleDestroy, 
    * The claimed instance with its journal, or `null` when that can't be read (a codec whose key is gone wrote part of
    * the journal, as after a key rotation that was rolled back): then it is handed back, as a claim hands back an
    * instance whose own payloads can't be read, instead of holding its lease and its concurrency slot until the lease
-   * expires, and going first at every claim after that.
+   * expires, and going first at every claim after that. A detached run leaves its lease to expire.
    */
-  private async claimed(instance: ClaimedWorkflowInstance, signalCursor: number): Promise<WorkflowInstanceDetails | null> {
+  private async claimed(instance: ClaimedWorkflowInstance, signalCursor: number, run: LeasedRun): Promise<WorkflowInstanceDetails | null> {
     let details: WorkflowInstanceDetails | null;
     try {
       details = await this.store.get(instance.id, { journal: true });
     } catch (error) {
+      if (run.detached) {
+        return null;
+      }
       this.logger.error(`Instance "${instance.id}" can't be read, so it isn't run; it is claimed again later.`, error as Error);
       const lease = { now: this.clock.now(), leaseUntil: instance.leaseUntil!, signalCursor };
       // At worst its lease expires, as if its worker had died.
-      await this.storage[ENGINE_STORE].handBack(instance.id, instance.leaseToken, lease).catch(() => undefined);
+      await this.store.handBack(instance.id, instance.leaseToken, lease, () => run.detached).catch(() => undefined);
       return null;
     }
 
-    if (!details) {
+    if (!details && !run.detached) {
       throw new Error(`The store has no instance "${instance.id}", which it just leased.`);
     }
     return details;
