@@ -17,10 +17,10 @@ import { setRepeatingTimer, setTimer } from '../utils/timer.util.js';
  * once after `kick()` (a local write made something due) or when an item ends. `drain()` runs due items on demand, for
  * tests and scripts.
  *
- * Shutdown is graceful: call `shutdown()` from `onModuleDestroy`. It stops claiming, waits for the claims in flight
- * (what they claim starts, told to stop at once), aborts every running item's `signal`, and waits up to
- * `shutdownTimeout` for them; the ones still running are then detached (no more renewals) and keep their lease until
- * it expires, as their work may still be going on.
+ * Shutdown is graceful: call `shutdown()` from `onModuleDestroy`. It stops claiming, aborts every running item's
+ * `signal`, and gives in-flight claims and executions a shared `shutdownTimeout`. Items claimed within that time
+ * start with an aborted signal so they can be handed back. Late claims and detached executions keep their leases
+ * until they expire.
  *
  * ```ts
  * @Injectable()
@@ -56,8 +56,8 @@ export class LeasedWorker<T> {
   private readonly shutdownMs: number;
   private readonly produceMs: number;
   private readonly runs = new Set<Run<T>>();
-  /** Claims in flight: shutdown waits for them, so nothing they claim starts unobserved. */
-  private readonly claiming = new Set<Promise<unknown>>();
+  /** Claims in flight and how to stop waiting for each one. */
+  private readonly claiming = new Map<Promise<T[]>, () => void>();
   private stopped = false;
   /** Ends the `drain()` rounds waiting now, at shutdown. */
   private readonly stopping = new Set<() => void>();
@@ -130,8 +130,8 @@ export class LeasedWorker<T> {
   }
 
   /**
-   * Stops for good: no more claims, the claims in flight awaited, every running item's `signal` aborted, and at most
-   * `shutdownTimeout` spent waiting for them before the rest are detached. Call it from `onModuleDestroy`.
+   * Stops for good and aborts running items. Claims and executions share `shutdownTimeout`. The polling loop also
+   * waits for any `produce()` in flight. Call it from `onModuleDestroy`.
    */
   async shutdown(): Promise<void> {
     if (this.stopped) {
@@ -144,18 +144,25 @@ export class LeasedWorker<T> {
     }
     this.wake?.();
 
-    // What a claim in flight claims starts now, told to stop at once, so it is handed back before the store closes.
-    await Promise.allSettled(this.claiming);
-    for (const run of this.runs) {
-      run.halt();
-    }
-
     let timer: NodeJS.Timeout | undefined;
-    await Promise.race([
-      Promise.allSettled([...this.runs].map((run) => run.done)),
-      new Promise<void>((resolve) => (timer = setTimer(resolve, this.shutdownMs))),
-    ]);
-    clearTimeout(timer);
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimer(() => {
+        for (const abandon of this.claiming.values()) {
+          abandon();
+        }
+        resolve();
+      }, this.shutdownMs);
+    });
+    try {
+      for (const run of this.runs) {
+        run.halt();
+      }
+      // Claims that answer in time launch with an aborted signal and join the executions we wait for.
+      await Promise.allSettled(this.claiming.keys());
+      await Promise.race([Promise.allSettled([...this.runs].map((run) => run.done)), deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
 
     for (const run of this.runs) {
       run.detach();
@@ -230,14 +237,23 @@ export class LeasedWorker<T> {
 
   /** Claims due items and starts executing them (before any caller sees them). */
   private async claim(limit: number): Promise<Promise<void>[]> {
-    if (limit <= 0) {
+    if (this.stopped || limit <= 0) {
       return [];
     }
 
     const now = this.clock.now();
     const lease: LeaseRequest = { owner: this.owner, token: randomUUID(), now, until: now + this.leaseMs };
-    const claim = this.options.claim(lease, limit);
-    this.claiming.add(claim);
+    const controller = new AbortController();
+    let abandon!: () => void;
+    const abandoned = new Promise<T[]>((resolve) => {
+      abandon = () => {
+        resolve([]);
+        controller.abort();
+      };
+    });
+    // Poll and drain both stop waiting at the deadline. The store call may still settle, and the race observes it.
+    const claim = Promise.race([this.options.claim(lease, limit, controller.signal), abandoned]);
+    this.claiming.set(claim, abandon);
     try {
       const items = await claim;
       return items.map((item) => this.launch(item));

@@ -17,7 +17,7 @@ import {
   type WorkflowPayloadContext,
   type WorkflowStore,
 } from '../lib/index.js';
-import { boot, storeKind, tempDb, World, type Node, type TestDb } from './support.js';
+import { boot, deferred, storeKind, tempDb, World, type Node, type TestDb } from './support.js';
 
 const KEY_1 = randomBytes(32);
 const KEY_2 = randomBytes(32).toString('base64');
@@ -465,6 +465,55 @@ describe('a codec', () => {
     expect(await node.store.get('unreadable')).toMatchObject({ status: 'running', runs: 1, leaseUntil: null, wakeAt: clock.now() + 30_000 });
     expect(await node.store.get('readable')).toMatchObject({ status: 'suspended' });
     expect(error).toHaveBeenCalledWith(expect.stringContaining('Instance "unreadable" can\'t be read, so it isn\'t run; it is claimed again later.'));
+  });
+
+  it.each(['claim', 'decode'])('skips cleanup when a stalled %s outlives shutdown', async (stage) => {
+    const codec = aes();
+    const node = await start(codec);
+    await node.client.start(RefundWorkflow, { orderId: 'o-1', card: SECRET }, { id: 'unreadable' });
+    const held = deferred();
+    const release = deferred();
+    const decode = vi.spyOn(codec, 'decode').mockImplementation(async () => {
+      if (stage === 'decode') {
+        held.resolve();
+        await release.promise;
+      }
+      throw new Error('key removed');
+    });
+    if (stage === 'claim') {
+      const claim = node.store.claim.bind(node.store);
+      vi.spyOn(node.store, 'claim').mockImplementationOnce(async (request) => {
+        const result = await claim(request);
+        held.resolve();
+        await release.promise;
+        return result;
+      });
+    }
+    vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const read = vi.spyOn(node.store, 'get');
+    const write = vi.spyOn(node.store, 'write');
+    const draining = node.worker.drain();
+    try {
+      await held.promise;
+      vi.useFakeTimers();
+      const stopped = vi.fn();
+      const stopping = node.worker.shutdown().then(stopped);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(stopped).toHaveBeenCalledOnce();
+      await stopping;
+
+      release.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(decode).toHaveBeenCalledTimes(stage === 'decode' ? 1 : 0);
+      expect(read).not.toHaveBeenCalled();
+      expect(write).not.toHaveBeenCalled();
+      vi.useRealTimers();
+      expect(await node.store.get('unreadable')).toMatchObject({ leaseUntil: clock.now() + 30_000, runs: 1 });
+    } finally {
+      release.resolve();
+      vi.useRealTimers();
+      await draining;
+    }
   });
 
   it("doesn't let an instance it can't read hold a concurrency slot, or go first at every claim", async () => {
